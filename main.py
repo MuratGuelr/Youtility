@@ -708,6 +708,8 @@ class VideoDownloader(QMainWindow):
             # Video başlığı
             title = info.get('title', 'Başlık bulunamadı')
             self.title_label.setText(f"📹 {title}")
+            self.title_label.setWordWrap(True)  # Eğer gerekirse satıra kaydır
+            self.title_label.setMaximumWidth(500)  # Çok uzun başlıkların yayılmasını önler
             self.title_label.setStyleSheet("""
                 QLabel {
                     font-size: 14px;
@@ -724,9 +726,10 @@ class VideoDownloader(QMainWindow):
             self.channel_label.setText(f"👤 Kanal: {channel}")
             self.channel_label.setStyleSheet("""
                 QLabel {
-                    color: #90caf9;
-                    font-size: 13px;
-                    padding: 3px;
+                    font-weight: bold;
+                    color: #8721fc;
+                    font-size: 14px;
+                    padding: 2px;
                 }
             """)
             
