@@ -1,5 +1,12 @@
+<<<<<<< HEAD
 PyQt6
 yt-dlp
 requests
 ffmpeg-python
 sqlite3
+=======
+PyQt5
+yt-dlp
+imageio-ffmpeg
+  
+>>>>>>> fc87a0402d123dd79bef33afab468843288daeb8
