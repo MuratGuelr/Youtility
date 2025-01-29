@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QTabWidget,
                             QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                             QPushButton, QComboBox, QProgressBar, QMessageBox,
                             QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView,
-                            QGroupBox, QSpinBox, QCheckBox,QSystemTrayIcon)
+                            QGroupBox, QSpinBox, QCheckBox,QSystemTrayIcon, QMenu)
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QDateTime, QUrl, QMetaObject,
                          Q_ARG, pyqtSlot, QTimer)
 from PyQt6.QtGui import QPixmap, QDesktopServices, QColor, QIcon
@@ -28,19 +28,45 @@ class VideoDownloader(QMainWindow):
         super().__init__()
         self.setWindowTitle("YouTube Video Downloader by ConsolAktif")
 
-        # İkonu ayarla
-        self.setWindowIcon(QIcon("icon.ico"))  
+        # İkon yolunu doğru şekilde al
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+        
+        # İkonu yükle ve kontrol et
+        if os.path.exists(icon_path):
+            icon = QIcon(icon_path)
+            self.setWindowIcon(icon)  # Pencere ikonu
+            
+            # Tray icon ayarları
+            self.tray_icon = QSystemTrayIcon(self)
+            self.tray_icon.setIcon(icon)  # Aynı ikonu tray için kullan
+            self.tray_icon.setToolTip("YouTube Video Downloader by ConsolAktif")
+            
+            # Windows'ta görev çubuğu ikonu için
+            if os.name == 'nt':  # Windows ise
+                import ctypes
+                myappid = 'consolaktif.youtubedownloader.1.0'  # Arbitrary string
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        else:
+            print(f"İkon dosyası bulunamadı: {icon_path}")
+        
+        # Tray menüsü oluştur
+        tray_menu = QMenu()
+        show_action = tray_menu.addAction("Göster")
+        show_action.triggered.connect(self.show)
+        quit_action = tray_menu.addAction("Çıkış")
+        quit_action.triggered.connect(app.quit)
+        self.tray_icon.setContextMenu(tray_menu)
+        
+        self.tray_icon.setVisible(True)
+
+        # Diğer başlangıç ayarları
         self.active_download = None
         self.download_path = os.path.expanduser("~/Downloads")
         self.setup_ui_style()
         self.init_ui()
         self.download_manager = DownloadManager()
-        self.load_settings()  # Ayarları yükle
+        self.load_settings()
 
-        # Tray iconu oluştur
-        self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon("icon.ico"))
-        self.tray_icon.setVisible(True)  # Simgeyi görev çubuğunda göster
 
     def setup_ui_style(self):
         self.setStyleSheet("""
@@ -701,9 +727,12 @@ class VideoDownloader(QMainWindow):
     def update_video_info(self, info):
         """Video bilgilerini güncelle"""
         try:
+            # Thumbnail URL'sini sakla
+            self.current_thumbnail_url = info.get('thumbnail')
+            
             # Thumbnail
-            if info.get('thumbnail'):
-                thumbnail_data = requests.get(info['thumbnail']).content
+            if self.current_thumbnail_url:
+                thumbnail_data = requests.get(self.current_thumbnail_url).content
                 pixmap = QPixmap()
                 pixmap.loadFromData(thumbnail_data)
                 self.thumbnail_label.setPixmap(pixmap)
@@ -901,7 +930,7 @@ class VideoDownloader(QMainWindow):
             print(f"Format tablosu güncellenirken hata: {str(e)}")
 
     def download_thumbnail(self):
-        """Thumbnail'i indir"""
+        print(f"Thumbnail URL: {self.current_thumbnail_url}")  # URL'nin geldiğini doğrula
         if hasattr(self, 'current_thumbnail_url'):
             try:
                 response = requests.get(self.current_thumbnail_url)
@@ -916,8 +945,11 @@ class VideoDownloader(QMainWindow):
                         with open(file_path, 'wb') as f:
                             f.write(response.content)
                         QMessageBox.information(self, "Başarılı", "Thumbnail kaydedildi!")
+                else:
+                    QMessageBox.warning(self, "Hata", f"Thumbnail indirilemedi! HTTP Kodu: {response.status_code}")
             except Exception as e:
                 QMessageBox.warning(self, "Hata", f"Thumbnail indirilemedi: {str(e)}")
+
 
     def start_download(self, mp3_only=False):
         try:
@@ -1123,9 +1155,18 @@ class VideoDownloader(QMainWindow):
             
             if ffmpeg_path:
                 # FFmpeg versiyonunu al
-                result = subprocess.run([ffmpeg_path, '-version'], 
-                                     capture_output=True, 
-                                     text=True)
+                startupinfo = None
+                if os.name == 'nt':
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = subprocess.SW_HIDE
+
+                result = subprocess.run(
+                    [ffmpeg_path, '-version'],
+                    capture_output=True,
+                    text=True,
+                    startupinfo=startupinfo
+                )
                 version = result.stdout.split('\n')[0]
                 
                 # FFmpeg yolunu input'a otomatik ekle
@@ -1562,9 +1603,15 @@ class ConversionThread(QThread):
     def get_video_duration(self):
         """Video süresini al"""
         try:
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+
             cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
                    '-of', 'default=noprint_wrappers=1:nokey=1', self.input_file]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo)
             return float(result.stdout.strip())
         except Exception as e:
             print(f"Video süresi alınamadı: {str(e)}")
@@ -1596,11 +1643,18 @@ class ConversionThread(QThread):
                 self.output_file
             ]
 
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                universal_newlines=True
+                universal_newlines=True,
+                startupinfo=startupinfo
             )
 
             pattern = re.compile(r"frame=\s*(\d+)")
