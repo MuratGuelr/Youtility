@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QTabWidget,
                             QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                             QPushButton, QComboBox, QProgressBar, QMessageBox,
                             QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView,
-                            QGroupBox, QSpinBox, QCheckBox)
+                            QGroupBox, QSpinBox, QCheckBox,QSystemTrayIcon)
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QDateTime, QUrl, QMetaObject,
                          Q_ARG, pyqtSlot, QTimer)
 from PyQt6.QtGui import QPixmap, QDesktopServices, QColor, QIcon
@@ -36,6 +36,11 @@ class VideoDownloader(QMainWindow):
         self.init_ui()
         self.download_manager = DownloadManager()
         self.load_settings()  # Ayarları yükle
+
+        # Tray iconu oluştur
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(QIcon("icon.ico"))
+        self.tray_icon.setVisible(True)  # Simgeyi görev çubuğunda göster
 
     def setup_ui_style(self):
         self.setStyleSheet("""
