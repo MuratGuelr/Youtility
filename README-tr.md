@@ -2,7 +2,9 @@
 
 YouTube ve diğer platformlardan video ve ses indirmenizi sağlayan **modern ve şık** bir uygulama! 🚀
 
-![Ekran Görüntüsü](img/screenshot.jpg)
+| [![Screenshot](img/1.jpg)](img/1.jpg) | [![Screenshot](img/2.jpg)](img/2.jpg) |
+| ------------------------------------- | ------------------------------------- |
+| [![Screenshot](img/3.jpg)](img/3.jpg) | [![Screenshot](img/4.jpg)](img/4.jpg) |
 
 ## 📌 Özellikler
 

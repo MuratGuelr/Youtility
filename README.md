@@ -2,7 +2,9 @@
 
 A **modern and stylish** application that allows you to download videos and audio from YouTube and other platforms! 🚀
 
-![Screenshot](img/screenshot.jpg) 
+| [![Screenshot](img/1.jpg)](img/1.jpg) | [![Screenshot](img/2.jpg)](img/2.jpg) |
+| ------------------------------------- | ------------------------------------- |
+| [![Screenshot](img/3.jpg)](img/3.jpg) | [![Screenshot](img/4.jpg)](img/4.jpg) |
 
 ## 📌 Features
 
