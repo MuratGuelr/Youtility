@@ -196,7 +196,7 @@ class VideoDownloader(QMainWindow):
         """)
 
     def init_ui(self):
-        self.setMinimumSize(785, 760)
+        self.setMinimumSize(700, 650)
         
         # Ana widget ve layout
         central_widget = QWidget()
@@ -230,63 +230,102 @@ class VideoDownloader(QMainWindow):
         layout = QVBoxLayout(self.youtube_tab)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
+
+        # FFmpeg uyarı banner'ı
+        self.ffmpeg_warning_banner = QWidget()
+        self.ffmpeg_warning_banner.setStyleSheet("""
+                QWidget {
+                    border-radius: 4px;
+                    padding: 10px;
+                    margin-bottom: 10px;
+                }
+            """)
+        banner_layout = QHBoxLayout(self.ffmpeg_warning_banner)
+        banner_layout.setContentsMargins(10, 10, 10, 10)
         
-        # URL giriş container'ı
-        url_container = QWidget()
-        url_container.setStyleSheet("""
+        warning_text = QLabel("⚠️ FFmpeg kurulu değil. Video indirme işlemi için FFmpeg gereklidir.")
+        warning_text.setStyleSheet("color: #ffffff; font-size: 13px;border: 1px solid #404040;")
+        banner_layout.addWidget(warning_text)
+        
+        install_button = QPushButton("FFmpeg Kur")
+        install_button.setStyleSheet("""
+            QPushButton {
+                background-color: #cf0000;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 10px 15px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #e30202;
+            }
+        """)
+        install_button.clicked.connect(self.download_ffmpeg)
+        banner_layout.addWidget(install_button)
+        
+        layout.addWidget(self.ffmpeg_warning_banner)
+        self.ffmpeg_warning_banner.hide()  # Başlangıçta gizle
+
+        # Ana container'ı oluştur
+        main_container = QWidget()
+        main_layout = QVBoxLayout(main_container)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(30)
+        
+        # URL container'ını merkeze almak için
+        self.url_wrapper = QWidget()
+        self.url_wrapper_layout = QVBoxLayout(self.url_wrapper)  # Layout'u self ile erişilebilir yap
+        self.url_wrapper_layout.setContentsMargins(0, 50, 0, 50)
+        
+        # Logo ve başlık container'ı
+        self.logo_container = QWidget()  # self ile erişilebilir yap
+        logo_layout = QVBoxLayout(self.logo_container)
+        logo_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # Logo
+        logo_label = QLabel()
+        logo_pixmap = QPixmap("icon.ico").scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        logo_label.setPixmap(logo_pixmap)
+        logo_layout.addWidget(logo_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        # Başlık
+        title_label = QLabel("YouTube Video İndirici")
+        title_label.setStyleSheet("color: #ffffff; font-size: 24px; font-weight: bold; margin-top: 10px;")
+        logo_layout.addWidget(title_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        # Alt başlık
+        subtitle_label = QLabel("Video indirmek için YouTube bağlantısını yapıştırın")
+        subtitle_label.setStyleSheet("color: #b0b0b0; font-size: 14px;")
+        logo_layout.addWidget(subtitle_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        self.url_wrapper_layout.addWidget(self.logo_container)
+        
+        # URL girişi container'ı
+        self.url_container = QWidget()  # self ile erişilebilir yap
+        self.url_container.setStyleSheet("""
             QWidget {
                 background-color: #363636;
                 border-radius: 8px;
-                padding: 5px;
+                padding: 20px;
             }
         """)
-        url_layout = QVBoxLayout(url_container)
-        url_layout.setSpacing(10)
-        
-        # Başlık ve açıklama
-        header_container = QWidget()
-        header_layout = QHBoxLayout(header_container)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Logo (opsiyonel)
-        logo_label = QLabel()
-        logo_label.setPixmap(QPixmap("icon.ico").scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        header_layout.addWidget(logo_label)
-        
-        # Başlık ve açıklama için dikey layout
-        text_container = QWidget()
-        text_layout = QVBoxLayout(text_container)
-        text_layout.setContentsMargins(0, 0, 0, 0)
-        text_layout.setSpacing(2)
-        
-        title_label = QLabel("YouTube Video İndirici")
-        title_label.setStyleSheet("color: #ffffff; font-size: 16px; font-weight: bold;")
-        text_layout.addWidget(title_label)
-        
-        info_label = QLabel("Video indirmek için YouTube bağlantısını yapıştırın")
-        info_label.setStyleSheet("color: #b0b0b0; font-size: 12px;")
-        text_layout.addWidget(info_label)
-        
-        header_layout.addWidget(text_container, 1)
-        url_layout.addWidget(header_container)
-        
-        # URL girişi ve yapıştır butonu
-        input_container = QWidget()
-        input_layout = QHBoxLayout(input_container)
-        input_layout.setContentsMargins(0, 0, 0, 0)
-        input_layout.setSpacing(8)
+        url_layout = QHBoxLayout(self.url_container)
+        url_layout.setContentsMargins(10, 10, 10, 10)
+        url_layout.setSpacing(8)
         
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("YouTube URL'sini buraya yapıştırın")
-        self.url_input.setMinimumHeight(36)
+        self.url_input.setMinimumHeight(45)
         self.url_input.setStyleSheet("""
             QLineEdit {
                 background-color: #2b2b2b;
                 color: #ffffff;
                 border: 2px solid #1e1e1e;
                 border-radius: 4px;
-                padding: 5px 5px;
-                font-size: 13px;
+                padding: 5px 15px;
+                font-size: 14px;
             }
             QLineEdit:focus {
                 border: 2px solid #0d47a1;
@@ -294,8 +333,8 @@ class VideoDownloader(QMainWindow):
         """)
         
         self.paste_button = QPushButton("Yapıştır")
-        self.paste_button.setMinimumHeight(36)
-        self.paste_button.setFixedWidth(100)
+        self.paste_button.setMinimumHeight(45)
+        self.paste_button.setFixedWidth(120)
         self.paste_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.paste_button.clicked.connect(self.paste_url)
         self.paste_button.setStyleSheet("""
@@ -304,8 +343,8 @@ class VideoDownloader(QMainWindow):
                 color: white;
                 border: none;
                 border-radius: 4px;
-                padding: 5px 10px;
-                font-size: 13px;
+                padding: 5px 15px;
+                font-size: 14px;
                 font-weight: bold;
             }
             QPushButton:hover {
@@ -314,17 +353,14 @@ class VideoDownloader(QMainWindow):
             QPushButton:pressed {
                 background-color: #0a3d8f;
             }
-            QPushButton:disabled {
-                background-color: #263238;
-                color: #78909c;
-            }
         """)
         
-        input_layout.addWidget(self.url_input)
-        input_layout.addWidget(self.paste_button)
-        url_layout.addWidget(input_container)
+        url_layout.addWidget(self.url_input)
+        url_layout.addWidget(self.paste_button)
+        self.url_wrapper_layout.addWidget(self.url_container)
         
-        layout.addWidget(url_container)
+        main_layout.addWidget(self.url_wrapper)  # Burayı düzelttik
+        layout.addWidget(main_container)
         
         # Video bilgileri container'ı (başlangıçta gizli)
         self.video_info_container = QWidget()
@@ -360,6 +396,8 @@ class VideoDownloader(QMainWindow):
                 border-radius: 4px;
                 padding: 5px 15px;
                 font-size: 12px;
+                margin-top: 0;
+                z-index: 1000;
             }
             QPushButton:hover {
                 background-color: #4f4f4f;
@@ -1095,12 +1133,55 @@ class VideoDownloader(QMainWindow):
         """URL değiştiğinde video bilgilerini güncelle"""
         url = self.url_input.text().strip()
         if url:
-            # Butonu güncelle
-            self.paste_button.setText("Veri Alınıyor...")
-            self.paste_button.setEnabled(False)
-            self.fetch_video_info(url)
+            try:
+                # URL container'ını kompakt moda geçir
+                self.url_wrapper.setStyleSheet("""
+                    QWidget {
+                        margin: 0;
+                        padding: 0;
+                    }
+                """)
+                self.url_wrapper_layout.setContentsMargins(0, 10, 0, 10)  # Üst ve alt boşluğu azalt
+                self.logo_container.hide()  # Logo ve başlıkları gizle
+                self.url_container.setStyleSheet("""
+                    QWidget {
+                        background-color: #363636;
+                        border-radius: 4px;
+                        padding: 8px;
+                        margin: 0;
+                    }
+                """)
+                self.url_input.setMinimumHeight(36)  # Input boyutunu küçült
+                self.paste_button.setMinimumHeight(36)  # Buton boyutunu küçült
+                
+                # Butonu güncelle
+                self.paste_button.setText("Veri Alınıyor...")
+                self.paste_button.setEnabled(False)
+                self.fetch_video_info(url)
+            except Exception as e:
+                # Hata durumunda ana sayfa görünümüne geri dön
+                self.reset_url_view()
+                QMessageBox.warning(self, "Hata", str(e))
         else:
-            self.video_info_container.hide()
+            self.reset_url_view()
+
+    def reset_url_view(self):
+        """URL görünümünü ana sayfa haline getir"""
+        self.url_wrapper.setStyleSheet("")
+        self.url_wrapper_layout.setContentsMargins(0, 50, 0, 50)  # Normal boşlukları geri yükle
+        self.logo_container.show()  # Logo ve başlıkları göster
+        self.url_container.setStyleSheet("""
+            QWidget {
+                background-color: #363636;
+                border-radius: 8px;
+                padding: 20px;
+            }
+        """)
+        self.url_input.setMinimumHeight(45)  # Input boyutunu normale döndür
+        self.paste_button.setMinimumHeight(45)  # Buton boyutunu normale döndür
+        self.paste_button.setText("Yapıştır")
+        self.paste_button.setEnabled(True)
+        self.video_info_container.hide()
 
     def fetch_video_info(self, url):
         """Video bilgilerini al"""
@@ -1116,7 +1197,7 @@ class VideoDownloader(QMainWindow):
                 self.update_video_info(info)
                 
         except Exception as e:
-            self.video_info_container.hide()
+            self.reset_url_view()  # Hata durumunda ana sayfa görünümüne dön
             QMessageBox.warning(self, "Hata", f"Video bilgileri alınamadı: {str(e)}")
         finally:
             self.paste_button.setText("Yapıştır")
@@ -1383,9 +1464,6 @@ class VideoDownloader(QMainWindow):
 
             download_path = self.folder_input.text() or os.path.expanduser("~/Downloads")
             
-            # FFmpeg yolunu al
-            ffmpeg_path = os.path.join(os.getenv('APPDATA'), 'YouTubeDownloader', 'ffmpeg')
-            
             self.download_button.setEnabled(False)
             self.mp3_download_button.setEnabled(False)
             
@@ -1394,7 +1472,6 @@ class VideoDownloader(QMainWindow):
                 ydl_opts = {
                     'format': 'worstaudio/worst',
                     'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
-                    'ffmpeg_location': ffmpeg_path,  # FFmpeg konumunu belirt
                     'postprocessors': [{
                         'key': 'FFmpegExtractAudio',
                         'preferredcodec': 'mp3',
@@ -1417,7 +1494,6 @@ class VideoDownloader(QMainWindow):
                 ydl_opts = {
                     'format': f'{format_id}+bestaudio/best',
                     'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
-                    'ffmpeg_location': ffmpeg_path,  # FFmpeg konumunu belirt
                     'merge_output_format': 'mkv',
                     'quiet': True,
                     'no_warnings': True,
@@ -1561,33 +1637,44 @@ class VideoDownloader(QMainWindow):
         if folder:
             self.folder_input.setText(folder)
 
-    def get_ffmpeg_path(self):
-        """FFmpeg yürütülebilir dosyasının yolunu al"""
-        ffmpeg_path = os.path.join(os.getenv('APPDATA'), 'YouTubeDownloader', 'ffmpeg', 'ffmpeg.exe')
-        return ffmpeg_path
-
-    def get_ffprobe_path(self):
-        """FFprobe yürütülebilir dosyasının yolunu al"""
-        ffprobe_path = os.path.join(os.getenv('APPDATA'), 'YouTubeDownloader', 'ffmpeg', 'ffprobe.exe')
-        return ffprobe_path
-
     def update_ffmpeg_status(self):
         """FFmpeg durumunu kontrol et ve güncelle"""
-        appdata_path = os.path.join(os.getenv('APPDATA'), 'YouTubeDownloader', 'ffmpeg')
-        ffmpeg_exe = os.path.join(appdata_path, 'ffmpeg.exe')
-        
-        if os.path.exists(ffmpeg_exe):
-            self.ffmpeg_status.setText("✅  FFmpeg kurulu ve kullanıma hazır")
-            self.ffmpeg_status.setStyleSheet("""
-                QLabel {
-                    color: #4CAF50;
-                    font-size: 13px;
-                    padding: 5px;
-                }
-            """)
-            self.ffmpeg_download_button.hide()
-        else:
-            self.ffmpeg_status.setText("❌  FFmpeg kurulu değil")
+        try:
+            # FFmpeg'i sistem komutları arasında ara
+            result = subprocess.run(['where', 'ffmpeg'], capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                # FFmpeg bulundu
+                self.ffmpeg_status.setText("✅  FFmpeg kurulu ve kullanıma hazır")
+                self.ffmpeg_status.setStyleSheet("""
+                    QLabel {
+                        color: #4CAF50;
+                        font-size: 13px;
+                        padding: 5px;
+                    }
+                """)
+                self.ffmpeg_download_button.hide()
+                # YouTube tabindeki banner'ı gizle
+                if hasattr(self, 'ffmpeg_warning_banner'):
+                    self.ffmpeg_warning_banner.hide()
+            else:
+                # FFmpeg bulunamadı
+                self.ffmpeg_status.setText("❌  FFmpeg kurulu değil")
+                self.ffmpeg_status.setStyleSheet("""
+                    QLabel {
+                        color: #f44336;
+                        font-size: 13px;
+                        padding: 5px;
+                    }
+                """)
+                self.ffmpeg_download_button.show()
+                # YouTube tabindeki banner'ı göster
+                if hasattr(self, 'ffmpeg_warning_banner'):
+                    self.ffmpeg_warning_banner.show()
+            
+        except Exception as e:
+            # Hata durumunda
+            self.ffmpeg_status.setText("❌  FFmpeg durumu kontrol edilemedi")
             self.ffmpeg_status.setStyleSheet("""
                 QLabel {
                     color: #f44336;
@@ -1598,7 +1685,7 @@ class VideoDownloader(QMainWindow):
             self.ffmpeg_download_button.show()
 
     def download_ffmpeg(self):
-        """FFmpeg'i AppData'ya indir ve kur"""
+        """FFmpeg'i winget ile indir ve kur"""
         try:
             if os.name != 'nt':
                 QMessageBox.warning(self, "Hata", "Bu özellik sadece Windows'ta kullanılabilir.")
@@ -1606,7 +1693,7 @@ class VideoDownloader(QMainWindow):
 
             # İndirme başlamadan önce kullanıcıya bilgi ver
             progress_dialog = QDialog(self)
-            progress_dialog.setWindowTitle("FFmpeg İndiriliyor")
+            progress_dialog.setWindowTitle("FFmpeg Kuruluyor")
             progress_dialog.setFixedSize(300, 150)
             progress_dialog.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.CustomizeWindowHint | Qt.WindowType.WindowTitleHint)
             
@@ -1614,124 +1701,68 @@ class VideoDownloader(QMainWindow):
             layout = QVBoxLayout(progress_dialog)
             
             # Bilgi etiketi
-            info_label = QLabel("FFmpeg indiriliyor ve kuruluyor...")
+            info_label = QLabel("FFmpeg winget ile kuruluyor...")
             layout.addWidget(info_label)
             
             # Progress bar
             progress_bar = QProgressBar()
-            progress_bar.setRange(0, 100)
+            progress_bar.setRange(0, 0)  # Belirsiz ilerleme
             layout.addWidget(progress_bar)
             
             # Durum etiketi
-            status_label = QLabel("İndirme başlatılıyor...")
+            status_label = QLabel("Kurulum başlatılıyor...")
             layout.addWidget(status_label)
             
             progress_dialog.show()
             QApplication.processEvents()
 
             self.ffmpeg_download_button.setEnabled(False)
-            self.ffmpeg_status.setText("FFmpeg indiriliyor...")
+            self.ffmpeg_status.setText("FFmpeg kuruluyor...")
 
-            # FFmpeg dizinini al/oluştur
-            app_data_dir = self.get_app_data_dir()
-            ffmpeg_dir = os.path.join(app_data_dir, 'ffmpeg')
-            if not os.path.exists(ffmpeg_dir):
-                os.makedirs(ffmpeg_dir)
-
-            # En son FFmpeg sürümünü kullan
-            ffmpeg_url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
-            
+            # winget ile FFmpeg kurulumunu başlat
             try:
-                status_label.setText("FFmpeg indiriliyor...")
-                response = requests.get(ffmpeg_url, stream=True)
-                response.raise_for_status()
+                # Önce winget'in kurulu olup olmadığını kontrol et
+                subprocess.run(['winget', '--version'], capture_output=True, text=True, check=True)
                 
-                # Toplam boyutu al
-                total_size = int(response.headers.get('content-length', 0))
-                block_size = 8192
-                downloaded = 0
-                
-                # İndirme başlangıç zamanını kaydet
-                start_time = time.time()
-                
-                # Zip dosyasını kaydet
-                zip_path = os.path.join(ffmpeg_dir, 'ffmpeg.zip')
-                with open(zip_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=block_size):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            # İlerlemeyi güncelle
-                            if total_size:
-                                percent = int((downloaded / total_size) * 100)
-                                progress_bar.setValue(percent)
-                                status_label.setText(f"İndiriliyor... %{percent}")
-                                
-                                # Tahmini kalan süre hesapla
-                                if downloaded > 0:
-                                    elapsed = time.time() - start_time
-                                    speed = downloaded / elapsed  # bytes/second
-                                    if speed > 0:  # Sıfıra bölme hatasını önle
-                                        remaining = (total_size - downloaded) / speed
-                                        if remaining > 60:
-                                            eta = f"{remaining/60:.1f} dakika"
-                                        else:
-                                            eta = f"{remaining:.0f} saniye"
-                                        status_label.setText(f"İndiriliyor... %{percent} (Kalan: {eta})")
-                                
-                                QApplication.processEvents()
-
-                # Zip'i çıkart
-                status_label.setText("Dosyalar çıkartılıyor...")
-                progress_bar.setRange(0, 0)  # Belirsiz ilerleme
-                QApplication.processEvents()
-                
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    # Sadece gerekli dosyaları çıkart
-                    for file in zip_ref.namelist():
-                        if file.endswith(('ffmpeg.exe', 'ffprobe.exe')):
-                            zip_ref.extract(file, ffmpeg_dir)
-                            # Dosyaları kök dizine taşı
-                            src = os.path.join(ffmpeg_dir, file)
-                            dst = os.path.join(ffmpeg_dir, os.path.basename(file))
-                            if os.path.exists(dst):
-                                os.remove(dst)
-                            shutil.move(src, dst)
-
-                # Zip dosyasını ve gereksiz klasörleri temizle
-                os.remove(zip_path)
-                # Boş klasörleri temizle
-                for root, dirs, files in os.walk(ffmpeg_dir, topdown=False):
-                    for name in dirs:
-                        try:
-                            dir_path = os.path.join(root, name)
-                            if not os.listdir(dir_path):  # Klasör boşsa
-                                os.rmdir(dir_path)
-                        except:
-                            pass
-
-                # Progress dialog'u kapat
-                progress_dialog.close()
-                progress_dialog.deleteLater()
-                
-                # FFmpeg durumunu güncelle
-                self.update_ffmpeg_status()
-
-                # Başarı mesajı
-                QMessageBox.information(
-                    self, 
-                    "Başarılı", 
-                    "FFmpeg başarıyla indirildi ve kuruldu."
+                # FFmpeg'i kur
+                status_label.setText("FFmpeg kuruluyor... Bu işlem birkaç dakika sürebilir.")
+                result = subprocess.run(
+                    ['winget', 'install', '--id', 'Gyan.FFmpeg', '--accept-source-agreements', '--accept-package-agreements'],
+                    capture_output=True,
+                    text=True
                 )
 
+                if result.returncode == 0:
+                    progress_dialog.close()
+                    progress_dialog.deleteLater()
+                    
+                    # FFmpeg durumunu güncelle
+                    self.update_ffmpeg_status()
+
+                    # Başarı mesajı
+                    QMessageBox.information(
+                        self, 
+                        "Başarılı", 
+                        "FFmpeg başarıyla kuruldu. Programı kullanabilirsiniz."
+                    )
+                else:
+                    raise Exception(f"Winget kurulum hatası: {result.stderr}")
+
+            except FileNotFoundError:
+                progress_dialog.close()
+                progress_dialog.deleteLater()
+                QMessageBox.warning(
+                    self,
+                    "Hata",
+                    "Winget bulunamadı. Lütfen Windows'unuzu güncelleyin veya Microsoft Store'dan App Installer'ı yükleyin."
+                )
             except Exception as e:
                 progress_dialog.close()
                 progress_dialog.deleteLater()
                 QMessageBox.warning(
-                    self, 
-                    "Hata", 
-                    f"FFmpeg indirme hatası: {str(e)}"
+                    self,
+                    "Hata",
+                    f"FFmpeg kurulumu sırasında hata oluştu: {str(e)}"
                 )
 
         except Exception as e:
