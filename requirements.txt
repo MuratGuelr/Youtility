@@ -6,6 +6,7 @@ ffmpeg-python
 sqlite3
 ffmpeg-python
 python-ffmpeg-binary
+
 =======
 PyQt5
 yt-dlp
