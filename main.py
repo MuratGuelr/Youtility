@@ -27,7 +27,7 @@ import zipfile
 class VideoDownloader(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("YouTube Video Downloader by ConsolAktif")
+        self.setWindowTitle("Youtility")
 
         # İkon yolunu doğru şekilde al
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
@@ -40,7 +40,7 @@ class VideoDownloader(QMainWindow):
             # Tray icon ayarları
             self.tray_icon = QSystemTrayIcon(self)
             self.tray_icon.setIcon(icon)  # Aynı ikonu tray için kullan
-            self.tray_icon.setToolTip("YouTube Video Downloader by ConsolAktif")
+            self.tray_icon.setToolTip("Youtility")
             
             # Windows'ta görev çubuğu ikonu için
             if os.name == 'nt':  # Windows ise
@@ -216,7 +216,7 @@ class VideoDownloader(QMainWindow):
 
         # Tabları ekle
         self.tabs.addTab(self.youtube_tab, "YouTube Video")
-        self.tabs.addTab(self.codec_tab, "Video Codec Düzenleme")
+        self.tabs.addTab(self.codec_tab, "Video Codec")
         self.tabs.addTab(self.settings_tab, "Ayarlar")
 
         # Tab içeriklerini oluştur
@@ -286,12 +286,12 @@ class VideoDownloader(QMainWindow):
         
         # Logo
         logo_label = QLabel()
-        logo_pixmap = QPixmap("icon.ico").scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        logo_pixmap = QPixmap("icon.ico").scaled(128,128, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         logo_label.setPixmap(logo_pixmap)
         logo_layout.addWidget(logo_label, alignment=Qt.AlignmentFlag.AlignCenter)
         
         # Başlık
-        title_label = QLabel("YouTube Video İndirici")
+        title_label = QLabel("YouTube Video İndir")
         title_label.setStyleSheet("color: #ffffff; font-size: 24px; font-weight: bold; margin-top: 10px;")
         logo_layout.addWidget(title_label, alignment=Qt.AlignmentFlag.AlignCenter)
         
@@ -823,6 +823,40 @@ class VideoDownloader(QMainWindow):
         audio_codec_layout.addWidget(audio_codec_label)
         audio_codec_layout.addWidget(self.audio_codec_combo)
         codec_layout.addWidget(audio_codec_container)
+        
+        # Hızlandırma modunu seçme (CPU / NVIDIA / AMD / AMD APU)
+        acceleration_container = QWidget()
+        acceleration_layout = QHBoxLayout(acceleration_container)
+        acceleration_layout.setContentsMargins(10, 10, 10, 10)
+        acceleration_label = QLabel("Hızlandırma Modu:")
+        acceleration_label.setStyleSheet("color: #ffffff; font-size: 13px;")
+        self.acceleration_mode_combo = QComboBox()
+        self.acceleration_mode_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #363636;
+                color: #ffffff;
+                border: 1px solid #4a4a4a;
+                border-radius: 4px;
+                padding: 5px 10px;
+                min-height: 30px;
+                font-size: 13px;
+            }
+            QComboBox::drop-down {
+                border: none;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #363636;
+                color: #ffffff;
+                selection-background-color: #0d47a1;
+                selection-color: #ffffff;
+            }
+        """)
+        # Populate the acceleration combobox with available options.
+        modes = self.get_available_acceleration_modes()
+        self.acceleration_mode_combo.addItems(modes)
+        acceleration_layout.addWidget(acceleration_label)
+        acceleration_layout.addWidget(self.acceleration_mode_combo)
+        codec_layout.addWidget(acceleration_container)
         
         layout.addWidget(codec_container)
         
@@ -1467,20 +1501,20 @@ class VideoDownloader(QMainWindow):
             self.download_button.setEnabled(False)
             self.mp3_download_button.setEnabled(False)
             
+            # Instead of using postprocessor_args in the options, we download the audio stream in its original format.
             if mp3_only:
                 self.mp3_download_button.setText("MP3 İndiriliyor...")
+                # Set a flag so later we know to convert manually.
+                self.mp3_conversion_mode = True
                 ydl_opts = {
                     'format': 'worstaudio/worst',
+                    # Download using the original extension (e.g., m4a) first.
                     'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '128',
-                    }],
                     'quiet': True,
                     'no_warnings': True
                 }
             else:
+                self.mp3_conversion_mode = False
                 self.download_button.setText("Video İndiriliyor...")
                 selected_items = self.format_table.selectedItems()
                 if not selected_items:
@@ -1506,14 +1540,12 @@ class VideoDownloader(QMainWindow):
                     }]
                 }
 
-            # İndirme thread'ini başlat
             self.active_download = DownloadThread(url, download_path, ydl_opts)
             self.active_download.progress_signal.connect(self.update_progress)
             self.active_download.error_signal.connect(self.on_download_error)
             self.active_download.finished_signal.connect(self.on_download_complete)
             self.active_download.start()
 
-            # Sadece iptal butonunu aktif et
             self.cancel_button.setEnabled(True)
 
         except Exception as e:
@@ -1582,21 +1614,52 @@ class VideoDownloader(QMainWindow):
         self.reset_download_state()
 
     def on_download_complete(self, downloaded_file):
-        """İndirme tamamlandığında çağrılır"""
+        """Called once download is complete."""
         try:
             if downloaded_file:
+                # If in MP3 conversion mode, convert the downloaded audio
+                if hasattr(self, 'mp3_conversion_mode') and self.mp3_conversion_mode:
+                    converted_file = self.convert_to_mp3_with_libshine(downloaded_file)
+                    if converted_file:
+                        final_file = converted_file
+                    else:
+                        final_file = downloaded_file
+                else:
+                    final_file = downloaded_file
+
                 self.add_to_history(
-                    os.path.basename(downloaded_file),
+                    os.path.basename(final_file),
                     self.url_input.text(),
                     "Tamamlandı",
-                    downloaded_file
+                    final_file
                 )
                 QMessageBox.information(self, "Başarılı", "İndirme tamamlandı!")
-            
         except Exception as e:
             print(f"İndirme geçmişi eklenirken hata: {str(e)}")
         finally:
             self.reset_download_state()
+
+    def convert_to_mp3_with_libshine(self, input_file):
+        """
+        Converts the downloaded audio file to MP3 using FFmpeg with libshine.
+        Make sure your FFmpeg build has libshine support.
+        """
+        import subprocess
+        # Remove the original extension and add .mp3
+        output_file = f"{os.path.splitext(input_file)[0]}.mp3"
+        command = [
+            'ffmpeg',
+            '-i', input_file,
+            '-c:a', 'libshine',  # Use libshine for faster MP3 encoding
+            '-b:a', '128k',
+            '-y', output_file
+        ]
+        try:
+            subprocess.run(command, check=True)
+            return output_file
+        except subprocess.CalledProcessError as e:
+            QMessageBox.warning(self, "Conversion Error", f"MP3 dönüştürme başarısız: {str(e)}")
+            return None
 
     def reset_download_state(self):
         """İndirme durumunu sıfırla"""
@@ -1697,19 +1760,14 @@ class VideoDownloader(QMainWindow):
             progress_dialog.setFixedSize(300, 150)
             progress_dialog.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.CustomizeWindowHint | Qt.WindowType.WindowTitleHint)
             
-            # Layout oluştur
             layout = QVBoxLayout(progress_dialog)
-            
-            # Bilgi etiketi
             info_label = QLabel("FFmpeg winget ile kuruluyor...")
             layout.addWidget(info_label)
             
-            # Progress bar
             progress_bar = QProgressBar()
             progress_bar.setRange(0, 0)  # Belirsiz ilerleme
             layout.addWidget(progress_bar)
             
-            # Durum etiketi
             status_label = QLabel("Kurulum başlatılıyor...")
             layout.addWidget(status_label)
             
@@ -1719,51 +1777,30 @@ class VideoDownloader(QMainWindow):
             self.ffmpeg_download_button.setEnabled(False)
             self.ffmpeg_status.setText("FFmpeg kuruluyor...")
 
-            # winget ile FFmpeg kurulumunu başlat
-            try:
-                # Önce winget'in kurulu olup olmadığını kontrol et
-                subprocess.run(['winget', '--version'], capture_output=True, text=True, check=True)
+            # PowerShell komutunu hazırla
+            ps_command = 'Start-Process powershell -ArgumentList "-Command &{winget install --id Gyan.FFmpeg --accept-source-agreements --accept-package-agreements}" -Verb RunAs -Wait'
+            
+            # PowerShell'i çalıştır
+            status_label.setText("FFmpeg kuruluyor... Bu işlem birkaç dakika sürebilir.")
+            result = subprocess.run(['powershell', '-Command', ps_command], 
+                                  capture_output=True, 
+                                  text=True)
+
+            if result.returncode == 0:
+                progress_dialog.close()
+                progress_dialog.deleteLater()
                 
-                # FFmpeg'i kur
-                status_label.setText("FFmpeg kuruluyor... Bu işlem birkaç dakika sürebilir.")
-                result = subprocess.run(
-                    ['winget', 'install', '--id', 'Gyan.FFmpeg', '--accept-source-agreements', '--accept-package-agreements'],
-                    capture_output=True,
-                    text=True
-                )
+                # FFmpeg durumunu güncelle
+                self.update_ffmpeg_status()
 
-                if result.returncode == 0:
-                    progress_dialog.close()
-                    progress_dialog.deleteLater()
-                    
-                    # FFmpeg durumunu güncelle
-                    self.update_ffmpeg_status()
-
-                    # Başarı mesajı
-                    QMessageBox.information(
-                        self, 
-                        "Başarılı", 
-                        "FFmpeg başarıyla kuruldu. Programı kullanabilirsiniz."
-                    )
-                else:
-                    raise Exception(f"Winget kurulum hatası: {result.stderr}")
-
-            except FileNotFoundError:
-                progress_dialog.close()
-                progress_dialog.deleteLater()
-                QMessageBox.warning(
-                    self,
-                    "Hata",
-                    "Winget bulunamadı. Lütfen Windows'unuzu güncelleyin veya Microsoft Store'dan App Installer'ı yükleyin."
+                # Başarı mesajı
+                QMessageBox.information(
+                    self, 
+                    "Başarılı", 
+                    "FFmpeg başarıyla kuruldu. Programı kullanabilirsiniz."
                 )
-            except Exception as e:
-                progress_dialog.close()
-                progress_dialog.deleteLater()
-                QMessageBox.warning(
-                    self,
-                    "Hata",
-                    f"FFmpeg kurulumu sırasında hata oluştu: {str(e)}"
-                )
+            else:
+                raise Exception(f"Winget kurulum hatası: {result.stderr}")
 
         except Exception as e:
             if 'progress_dialog' in locals():
@@ -1903,35 +1940,91 @@ class VideoDownloader(QMainWindow):
         if file_path:
             self.codec_file_input.setText(file_path)
 
+    def detect_gpu(self):
+        """
+        Detects the type of GPU available:
+          - Returns "NVIDIA" if an NVIDIA GPU is detected.
+          - Returns "AMD" or "AMD_APU" if an AMD GPU is detected.
+          - Otherwise returns "CPU".
+        """
+        import shutil
+        # Check if NVIDIA is available by trying to locate nvidia-smi
+        if shutil.which("nvidia-smi"):
+            return "NVIDIA"
+        
+        # For AMD on Windows, use WMIC to inspect video controllers
+        if os.name == "nt":
+            try:
+                output = subprocess.check_output(
+                    ["wmic", "path", "win32_VideoController", "get", "Name"],
+                    text=True
+                )
+                if "AMD" in output.upper():
+                    # Basic check: if "APU" also appears, assume it's an AMD APU.
+                    if "APU" in output.upper():
+                        return "AMD_APU"
+                    return "AMD"
+            except Exception:
+                pass
+        return "CPU"
+
+    def get_available_acceleration_modes(self):
+        """
+        Returns a list of available acceleration modes.
+        Always includes "CPU".
+        If an NVIDIA GPU is available, adds "NVIDIA".
+        If an AMD GPU/APU is available (on Windows), adds "AMD" or "AMD APU" accordingly.
+        """
+        modes = ["CPU"]
+        import shutil
+        if shutil.which("nvidia-smi"):
+            modes.append("NVIDIA")
+        if os.name == "nt":  # Windows check for AMD GPU/APU
+            try:
+                output = subprocess.check_output(
+                    ["wmic", "path", "win32_VideoController", "get", "Name"],
+                    text=True, stderr=subprocess.DEVNULL
+                )
+                output_upper = output.upper()
+                if "AMD" in output_upper:
+                    if "APU" in output_upper:
+                        modes.append("AMD APU")
+                    else:
+                        modes.append("AMD")
+            except Exception:
+                pass
+        return modes
+
     def start_conversion(self):
         """Codec dönüştürme işlemini başlat"""
         input_file = self.codec_file_input.text()
         if not input_file or not os.path.exists(input_file):
             QMessageBox.warning(self, "Hata", "Lütfen geçerli bir video dosyası seçin.")
             return
-        
+
         self.convert_button.setText("Dönüştürülüyor...")
-        # Seçilen codec'leri al
-        video_codec_name = self.video_codec_combo.currentText().lower().replace(".", "")  # h264, h265, vp9, av1
-        audio_codec_name = self.audio_codec_combo.currentText().lower()  # aac, mp3, opus, flac
-        
+
         # Dosya adını ve uzantısını ayır
         input_path = os.path.dirname(input_file)
         input_filename = os.path.splitext(os.path.basename(input_file))[0]
-        
-        # Yeni dosya adını oluştur
-        new_filename = f"{input_filename}_{video_codec_name}_{audio_codec_name}"
-        
+
+        # GPU kullanımına bağlı olarak dosya adına ekleme
+        # (In this case we append a "_gpu" suffix if the acceleration mode is not CPU)
+        acc_mode = self.acceleration_mode_combo.currentText()
+        gpu_suffix = "_gpu" if acc_mode != "CPU" else ""
+
+        new_filename = f"{input_filename}_{self.video_codec_combo.currentText()}_{self.audio_codec_combo.currentText()}{gpu_suffix}"
+
         # Çıktı formatını belirle (codec'e göre en uygun formatı seç)
         output_format = ".mp4"  # Varsayılan
-        if video_codec_name == "vp9":
+        if self.video_codec_combo.currentText() == "VP9":
             output_format = ".webm"
-        elif video_codec_name == "av1":
+        elif self.video_codec_combo.currentText() == "AV1":
             output_format = ".mkv"
-        
+
         # Önerilen çıktı dosyası yolu
         suggested_output = os.path.join(input_path, new_filename + output_format)
-        
+
         # Çıktı dosyası için kaydetme dialogu
         output_file, _ = QFileDialog.getSaveFileName(
             self,
@@ -1939,10 +2032,11 @@ class VideoDownloader(QMainWindow):
             suggested_output,
             "Video Dosyaları (*.mp4 *.mkv *.webm)"
         )
-        
+
         if not output_file:
+            self.convert_button.setText("Dönüştür")
             return
-        
+
         # Codec mapping
         video_codec_map = {
             "H.264": "libx264",
@@ -1950,18 +2044,35 @@ class VideoDownloader(QMainWindow):
             "VP9": "libvpx-vp9",
             "AV1": "libaom-av1"
         }
-        
+
         audio_codec_map = {
             "AAC": "aac",
             "MP3": "libmp3lame",
             "Opus": "libopus",
             "FLAC": "flac"
         }
-        
-        # FFmpeg komutunu oluştur
-        video_codec = video_codec_map[self.video_codec_combo.currentText()]
-        audio_codec = audio_codec_map[self.audio_codec_combo.currentText()]
-        
+
+        # Determine video encoder based on selected acceleration mode.
+        current_codec = self.video_codec_combo.currentText()
+        if acc_mode == "NVIDIA":
+            if current_codec == "H.264":
+                video_codec = "h264_nvenc"
+            elif current_codec == "H.265":
+                video_codec = "hevc_nvenc"
+            else:
+                video_codec = video_codec_map.get(current_codec, "")
+        elif acc_mode in ["AMD", "AMD APU"]:
+            if current_codec == "H.264":
+                video_codec = "h264_amf"
+            elif current_codec == "H.265":
+                video_codec = "hevc_amf"
+            else:
+                video_codec = video_codec_map.get(current_codec, "")
+        else:  # CPU selected
+            video_codec = video_codec_map.get(current_codec, "")
+
+        audio_codec = audio_codec_map.get(self.audio_codec_combo.currentText(), "")
+
         # Dönüştürme thread'ini başlat
         self.convert_button.setEnabled(False)
         self.conversion_thread = ConversionThread(
@@ -2336,127 +2447,82 @@ class DownloadThread(QThread):
 # Dönüştürme Thread sınıfı
 class ConversionThread(QThread):
     progress_signal = pyqtSignal(dict)
-    error_signal = pyqtSignal(str)
     finished_signal = pyqtSignal()
-
-    def __init__(self, input_file, output_file, video_codec, audio_codec):
+    error_signal = pyqtSignal(str)
+    
+    def __init__(self, input_file, output_file, video_codec, audio_codec, extra_params=None):
         super().__init__()
         self.input_file = input_file
         self.output_file = output_file
         self.video_codec = video_codec
         self.audio_codec = audio_codec
-        self.is_cancelled = False
-        self.start_time = None
-
-    def get_video_duration(self):
-        """Video süresini al"""
-        try:
-            startupinfo = None
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = subprocess.SW_HIDE
-
-            ffprobe_path = os.path.join(os.getenv('APPDATA'), 'YouTubeDownloader', 'ffmpeg', 'ffprobe.exe')
-            cmd = [ffprobe_path, '-v', 'error', '-show_entries', 'format=duration', 
-                   '-of', 'default=noprint_wrappers=1:nokey=1', self.input_file]
-            result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo)
-            return float(result.stdout.strip())
-        except Exception as e:
-            print(f"Video süresi alınamadı: {str(e)}")
-            return None
-
-    def format_time(self, seconds):
-        """Saniyeyi HH:MM:SS formatına çevir"""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        seconds = int(seconds % 60)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
+        self.extra_params = extra_params or []
+        self.is_running = True
+        
     def run(self):
         try:
-            # Video süresini al
-            duration = self.get_video_duration()
-            if duration is None:
-                duration = 0
-            
-            # Başlangıç zamanını kaydet
-            self.start_time = time.time()
-            
-            # FFmpeg yolunu al
-            ffmpeg_path = os.path.join(os.getenv('APPDATA'), 'YouTubeDownloader', 'ffmpeg', 'ffmpeg.exe')
-            
-            # FFmpeg komutu
-            cmd = [
-                ffmpeg_path, '-i', self.input_file,
+            # FFmpeg komut parametrelerini oluştur
+            command = [
+                'ffmpeg', '-i', self.input_file,
                 '-c:v', self.video_codec,
-                '-c:a', self.audio_codec,
-                '-y',
-                self.output_file
+                '-c:a', self.audio_codec
             ]
-
-            startupinfo = None
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = subprocess.SW_HIDE
-
+            
+            # Ek parametreleri ekle
+            command.extend(self.extra_params)
+            
+            # Çıktı dosyasını ekle
+            command.extend(['-y', self.output_file])
+            
+            # FFmpeg işlemini başlat
             process = subprocess.Popen(
-                cmd,
+                command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                universal_newlines=True,
-                startupinfo=startupinfo
+                universal_newlines=True
             )
-
-            pattern = re.compile(r"frame=\s*(\d+)")
+            
+            # İlerlemeyi takip et
+            duration = None
+            pattern = re.compile(r"Duration: (\d{2}):(\d{2}):(\d{2})\.\d{2}")
+            time_pattern = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.\d{2}")
             fps_pattern = re.compile(r"fps=\s*(\d+)")
-            time_pattern = re.compile(r"time=\s*(\d+:\d+:\d+\.\d+)")
-
-            while True:
-                line = process.stderr.readline()
-                if not line and process.poll() is not None:
+            
+            for line in process.stderr:
+                if not self.is_running:
+                    process.terminate()
                     break
-
-                frame_match = pattern.search(line)
-                fps_match = fps_pattern.search(line)
-                time_match = time_pattern.search(line)
-
-                if frame_match and time_match and fps_match:
-                    current_time = time_match.group(1)
-                    h, m, s = map(float, re.split('[:]', current_time))
-                    current_seconds = h * 3600 + m * 60 + s
                     
-                    if duration > 0:
-                        progress = (current_seconds / duration) * 100
-                        
-                        # Kalan süreyi hesapla
-                        elapsed_time = time.time() - self.start_time
-                        if progress > 0:
-                            total_estimated_time = elapsed_time * (100 / progress)
-                            remaining_time = total_estimated_time - elapsed_time
-                            eta = self.format_time(remaining_time)
-                        else:
-                            eta = "--:--:--"
-                    else:
-                        progress = 0
-                        eta = "--:--:--"
-                        
-                    fps = fps_match.group(1)
-
+                if duration is None:
+                    match = pattern.search(line)
+                    if match:
+                        h, m, s = map(int, match.groups())
+                        duration = h * 3600 + m * 60 + s
+                
+                time_match = time_pattern.search(line)
+                fps_match = fps_pattern.search(line)
+                
+                if time_match and duration:
+                    h, m, s = map(int, time_match.groups())
+                    current_time = h * 3600 + m * 60 + s
+                    progress = (current_time / duration) * 100
+                    
+                    fps = fps_match.group(1) if fps_match else "0"
+                    eta = duration - current_time
+                    eta_str = str(timedelta(seconds=eta))
+                    
                     self.progress_signal.emit({
-                        'percent': min(100, progress),
+                        'percent': progress,
+                        'time': f"{h:02d}:{m:02d}:{s:02d}",
                         'speed': fps,
-                        'time': current_time,
-                        'eta': eta
+                        'eta': eta_str
                     })
-
-            if process.returncode != 0:
-                error = process.stderr.read()
-                raise Exception(f"FFmpeg hatası: {error}")
-
-            self.finished_signal.emit()
-
+            
+            if process.wait() == 0 and self.is_running:
+                self.finished_signal.emit()
+            else:
+                raise Exception("Dönüştürme işlemi başarısız oldu.")
+                
         except Exception as e:
             self.error_signal.emit(str(e))
 
