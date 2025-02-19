@@ -1,4 +1,9 @@
-# 🎮 YouTube Video Downloader by ConsolAktif
+# 🔥 v4.0.0 Faster and Stronger! 🚀
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/MuratGuelr/youtube_download_by_consolaktif?style=for-the-badge)](https://github.com/MuratGuelr/youtube_download_by_consolaktif/releases)
+[![License](https://img.shields.io/github/license/MuratGuelr/youtube_download_by_consolaktif?style=for-the-badge)](https://github.com/MuratGuelr/youtube_download_by_consolaktif/blob/main/LICENSE)
+[![Python Version](https://img.shields.io/badge/Python-3.6%2B-blue?style=for-the-badge)](https://www.python.org)
+
+---
 
 A **modern and stylish** application that allows you to download videos and audio from YouTube and other platforms! 🚀
 
@@ -14,59 +19,77 @@ A **modern and stylish** application that allows you to download videos and audi
 👉 Can convert video formats (H.264, H.265, VP9, AV1).  
 👉 **Completely free and open-source!** 🎉
 
-## 🛠️ Requirements
+Welcome to the next generation of our **YouTube Downloader**. This release is **faster, stronger, and smarter** than ever before!
 
-To run this application, you need the following dependencies:
+### What's New
 
-- Python 3.9 or later
-- `pip install -r requirements.txt`
-- FFmpeg (Can be downloaded from within the program if necessary)
+- **Faster MP3 Conversion:**  
+  A two-step process that downloads the original audio and then uses FFmpeg with **libshine** (if supported) for a speeding up the MP3 conversion.
+- **GPU-Accelerated Video Conversion:**  
+  Leverages hardware-accelerated codecs (NVIDIA, AMD) when available for faster video processing.
+- **Enhanced User Interface & Error Handling:**  
+  Enjoy a sleek UI with smooth animations and detailed error messages.
+- **Auto-Detection of Hardware:**  
+  The application automatically detects your GPU to set the best conversion parameters.
 
-## 🚀 Installation and Usage
+### Getting Started
 
-1. **Install dependencies:**
-   ```sh
+#### Prerequisites
+
+- **Python 3.6+**
+- **FFmpeg:**  
+  Ensure FFmpeg is installed and in your system path.  
+  To check for libshine support, run:
+  ```bash
+  ffmpeg -encoders | grep libshine
+  ```
+- Required Python packages:
+  - `yt_dlp`
+  - `requests`
+  - `PyQt5` or `PyQt6`
+  - `sqlite3` (included with Python)
+
+#### Installation
+
+1. **Clone the Repository:**
+   ```bash
+   git clone https://github.com/MuratGuelr/youtube_download_by_consolaktif.git
+   cd youtube_download_by_consolaktif
+   ```
+2. **Install Dependencies:**
+   ```bash
    pip install -r requirements.txt
    ```
-2. **Run the application:**
-   ```sh
-   python main.py
+3. **Run the Application:**
+   ```bash
+   python FinalBreakdown.py
    ```
 
-## 🛠️ Creating an .exe File with PyInstaller
+### Feature Details
 
-If you want to create a standalone `.exe` file for the application:
+- **Video Downloads:**  
+  Supports various formats and uses hardware acceleration (if available) for faster video conversion.
+- **MP3 Downloads:**  
+  Downloads the audio stream first, then manually converts it to MP3 using libshine.
+- **Error Handling:**  
+  Improved logging and robust error messages assist in troubleshooting issues.
 
-1. Install PyInstaller:
-   ```sh
-   pip install pyinstaller
-   ```
-2. Run the following command to create the `.exe` file:
+### Troubleshooting
 
-   ```sh
-   pyinstaller --noconsole --onefile --icon=icon.ico --name="YouTube Video Downloader by ConsolAktif" main.py
-   ```
+If you see errors (such as the `postprocessor_args` error), the manual conversion method is now used.  
+Ensure your FFmpeg build includes libshine to enjoy faster MP3 encoding.
 
-   **Explanation:**
+### Contributing
 
-   - `--noconsole`: Prevents the command window from opening.
-   - `--onefile`: Creates a single `.exe` file.
-   - `--icon=icon.ico`: Adds a custom icon.
-   - `--name="YouTube Video Downloader by ConsolAktif"`: Sets the name of the `.exe` file.
+Contributions are welcome! Please fork the repository, make your changes, and open a pull request.  
+See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
 
-3. The generated `.exe` file will be located in the `dist` folder.
+### License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+
+### Contact
+
+For questions or suggestions, please open an issue on GitHub or contact [Murat Güler](mailto:desmeron134714@gmail.com).
 
 ---
-
-## 🐝 Contribute
-
-Would you like to contribute to the project? You can create a pull request or open an issue. ✨
-
-## 📚 License
-
-This project is licensed under the **MIT License**.
-
----
-
-**If you encounter any errors, please let me know.** 📩  
-🎥🎶 Enjoy using it!

@@ -1,72 +1,77 @@
-# 🎮 YouTube Video Downloader by ConsolAktif
+Hoş geldiniz! **YouTube Downloader**'ımın yeni nesline geçiş yaptık. Bu sürüm **daha hızlı, daha güçlü ve daha akıllı**!
 
-YouTube ve diğer platformlardan video ve ses indirmenizi sağlayan **modern ve şık** bir uygulama! 🚀
+### Yenilikler
 
-| [![Screenshot](img/1.jpg)](img/1.jpg) | [![Screenshot](img/2.jpg)](img/2.jpg) |
-| ------------------------------------- | ------------------------------------- |
-| [![Screenshot](img/3.jpg)](img/3.jpg) | [![Screenshot](img/4.jpg)](img/4.jpg) |
+- **Daha Hızlı MP3 Dönüştürme:**  
+  İki aşamalı süreç: Önce orijinal ses akışı indirilir, ardından FFmpeg ile **libshine** (varsa) kullanılarak MP3'e dönüştürme gerçekleştirilir.  
+  _Not: Daha hızlı dönüşüm için FFmpeg'inizin libshine desteğine sahip olması önerilir._
+- **GPU Hızlandırmalı Video Dönüştürme:**  
+  Mevcutsa NVIDIA veya AMD gibi GPU hızlandırmalı codec’ler kullanılarak video işleme süresi kısaltılır.
+- **Gelişmiş Kullanıcı Arayüzü & Hata Yönetimi:**  
+  Akıcı animasyonlar, modern ikonlar ve detaylı hata mesajlarıyla geliştirilmiş bir arayüz sunar.
+- **Donanım Otomatik Algılama:**  
+  Uygulama, sisteminizdeki GPU’yu otomatik olarak algılar ve en uygun ayarları belirler.
 
-## 📌 Özellikler
+### Başlarken
 
-👉 YouTube videolarını ve ses dosyalarını hızlıca indirir.  
-👉 Çeşitli format ve kalite seçenekleri sunar.  
-👉 Kullanıcı dostu, şık ve modern bir arayüze sahiptir.  
-👉 Video formatlarını dönüştürebilir (H.264, H.265, VP9, AV1).  
-👉 **Tamamen ücretsiz ve açık kaynak!** 🎉
+#### Gereksinimler
 
-## 🛠️ Gereksinimler
+- **Python 3.6+**
+- **FFmpeg:**  
+  FFmpeg’in sisteminizde yüklü olduğundan ve PATH’e eklendiğinden emin olun.  
+  Libshine desteğini kontrol etmek için:
+  ```bash
+  ffmpeg -encoders | grep libshine
+  ```
+- Gerekli Python paketleri:
+  - `yt_dlp`
+  - `requests`
+  - `PyQt5` veya `PyQt6`
+  - `sqlite3` (Python ile birlikte gelir)
 
-Bu uygulamayı çalıştırmak için aşağıdaki bağımlılıklara ihtiyacınız vardır:
+#### Kurulum
 
-- Python 3.9 veya daha yeni bir sürüm
-- `pip install -r requirements.txt`
-- FFmpeg (Gerekirse program içinden indirilebilir)
-
-## 🚀 Kurulum ve Kullanım
-
-1. **Bağımlılıkları yükleyin:**
-   ```sh
+1. **Depoyu Klonlayın:**
+   ```bash
+   git clone https://github.com/MuratGuelr/youtube_download_by_consolaktif.git
+   cd youtube_download_by_consolaktif
+   ```
+2. **Bağımlılıkları Yükleyin:**
+   ```bash
    pip install -r requirements.txt
    ```
-2. **Uygulamayı çalıştırın:**
-   ```sh
-   python main.py
+3. **Uygulamayı Çalıştırın:**
+   ```bash
+   python FinalBreakdown.py
    ```
 
-## 🛠️ PyInstaller ile .exe Dosyası Oluşturma
+### Özellikler
 
-Eğer uygulamanın çalıştırılabilir bir `.exe` dosyasını oluşturmak istiyorsanız:
+- **Video İndirme:**  
+  Çeşitli formatları destekler ve mevcut GPU hızlandırması sayesinde video dönüştürme süresini kısaltır.
+- **MP3 İndirme:**  
+  Ses akışı önce orijinal formatında indirilir, ardından libshine kullanılarak MP3’e dönüştürülür.
+- **Hata Yönetimi:**  
+  Geliştirilmiş hata mesajları ve loglama desteği sayesinde sorunlar kolayca tespit edilir.
 
-1. PyInstaller'ı yükleyin:
-   ```sh
-   pip install pyinstaller
-   ```
-2. `.exe` oluşturmak için aşağıdaki komutu çalıştırın:
+### Sorun Giderme
 
-   ```sh
-   pyinstaller --noconsole --onefile --icon=icon.ico --name="YouTube Video Downloader by ConsolAktif" main.py
-   ```
+`postprocessor_args` ile ilgili hatalar alırsanız, artık manuel dönüşüm yöntemi devreye girmektedir.  
+Daha hızlı dönüşüm için FFmpeg'inizin libshine desteğine sahip olduğundan emin olun.
 
-   **Açıklamalar:**
+### Katkıda Bulunma
 
-   - `--noconsole`: Komut penceresinin açılmasını engeller.
-   - `--onefile`: Tek bir `.exe` dosyası oluşturur.
-   - `--icon=icon.ico`: Özel bir simge ekler.
-   - `--name="YouTube Video Downloader by ConsolAktif"`: `.exe` dosyasının adını belirler.
+Katkılarınızı bekliyoruz! Lütfen projeyi fork’layın, değişikliklerinizi yapın ve pull request gönderin.  
+Detaylar için [CONTRIBUTING.md](CONTRIBUTING.md) dosyasına bakınız.
 
-3. Oluşturulan `.exe` dosyası `dist` klasöründe yer alacaktır.
+### Lisans
+
+Bu proje MIT Lisansı kapsamında lisanslanmıştır. Detaylar için [LICENSE](LICENSE) dosyasına göz atınız.
+
+### İletişim
+
+Sorularınız veya önerileriniz için lütfen GitHub üzerinden bir issue açın veya [Murat Güler](mailto:desmeron134714@gmail.com) ile iletişime geçin.
 
 ---
 
-## 🐝 Katkıda Bulunun
-
-Projeye katkıda bulunmak ister misiniz? Pull request veya issue oluşturabilirsiniz. ✨
-
-## 📚 Lisans
-
-Bu proje **MIT Lisansı** ile lisanslanmıştır.
-
----
-
-**Eğer herhangi bir hata alırsanız, lütfen bildirin.** 📩  
-🎥🎶 Keyifli kullanımlar dilerim!
+Enjoy the new release – **Faster and Stronger / Daha Hızlı ve Daha Güçlü!** 🎉
