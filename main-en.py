@@ -671,6 +671,19 @@ _GROUP = """
     }
 """
 
+# ─────────────────────────────────────────────────────────
+#  Icon and resource handling
+# ─────────────────────────────────────────────────────────
+
+def get_resource_path(relative_path):
+    """ PyInstaller MEIPASS can find the real path of a resource. """
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    
+    return os.path.join(base_path, relative_path)
+
 
 # ─────────────────────────────────────────────────────────
 #  Main Window
@@ -684,7 +697,7 @@ class VideoDownloader(QMainWindow):
         self.setWindowTitle("Youtility")
 
         # ── App icon ──
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+        icon_path = get_resource_path("icon.ico")
         self.tray_icon = QSystemTrayIcon(self)   # always create tray icon
 
         if os.path.exists(icon_path):
@@ -883,7 +896,7 @@ class VideoDownloader(QMainWindow):
         logo_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         logo_lbl = QLabel()
-        logo_px  = QPixmap("icon.ico").scaled(
+        logo_px  = QPixmap(get_resource_path("icon.ico")).scaled(
             128, 128,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
@@ -1439,7 +1452,7 @@ class VideoDownloader(QMainWindow):
                     end_t   = self.yt_end_time.text().strip()
                     if start_t and end_t:
                         ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(
-                            None, [(self._to_seconds(start_t), self._to_seconds(end_t))]
+                            None,[(self._to_seconds(start_t), self._to_seconds(end_t))]
                         )
                         ydl_opts["force_keyframes_at_cuts"] = True
                         self.download_progress.setRange(0, 0)
@@ -1452,39 +1465,37 @@ class VideoDownloader(QMainWindow):
                     QMessageBox.warning(self, "Warning", "Please select a format.")
                     self.reset_download_state()
                     return
-                fmt_id = self.format_table.item(selected[0].row(), 0).data(
-                    Qt.ItemDataRole.UserRole
-                )
+
+                # Seçilen satırdan Orijinal Format ID'sini ve "1080p, 4K" gibi metni alıyoruz
+                row = selected[0].row()
+                fmt_id = self.format_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+                quality_txt = self.format_table.item(row, 0).text()
+
+                # yt-dlp'nin tahminde bulunmasını engelleyip DOĞRUDAN kullanıcının seçtiği Format ID'yi istiyoruz
+                fmt_str = f"{fmt_id}+bestaudio/bestvideo+bestaudio/best"
+
                 ydl_opts = {
-                    "format": f"{fmt_id}+bestaudio/best",
-                    "outtmpl": os.path.join(download_path, "%(title)s_%(height)sp.%(ext)s"),
+                    "format": fmt_str,
+                    # outtmpl içinde quality_txt kullandık ki dosya adında 1080p, 4k gibi seçilen kalite yazsın
+                    "outtmpl": os.path.join(download_path, f"%(title)s_{quality_txt}.%(ext)s"),
                     "merge_output_format": "mkv",
                     "keepvideo": False,
-                    "quiet": True, "no_warnings": True,
-                    "postprocessors": [
-                        {"key": "FFmpegVideoConvertor", "preferedformat": "mkv"},
-                        {"key": "FFmpegVideoRemuxer",   "preferedformat": "mkv"},
-                    ],'extractor_args': {
-                        'youtube': {
-                            'player_client': ['web', 'android'],
-                        }
-                    },
-                    'http_headers': {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    },
+                    "quiet": True,
+                    "no_warnings": True,
                     **speed_opts,
                 }
+                
                 if self.yt_time_range_cb.isChecked():
                     start_t = self.yt_start_time.text().strip()
                     end_t   = self.yt_end_time.text().strip()
                     if start_t and end_t:
                         ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(
-                            None, [(self._to_seconds(start_t), self._to_seconds(end_t))]
+                            None,[(self._to_seconds(start_t), self._to_seconds(end_t))]
                         )
                         ydl_opts["force_keyframes_at_cuts"] = True
                     elif start_t:
                         ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(
-                            None, [(self._to_seconds(start_t), float("inf"))]
+                            None,[(self._to_seconds(start_t), float("inf"))]
                         )
                         ydl_opts["force_keyframes_at_cuts"] = True
                         self.download_progress.setRange(0, 0)
@@ -1794,7 +1805,7 @@ class VideoDownloader(QMainWindow):
         hdr_lyt.setSpacing(12)
         
         ic = QLabel()
-        ic.setPixmap(QPixmap("icon.ico").scaled(
+        ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(
             32, 32,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation
@@ -2146,12 +2157,19 @@ class VideoDownloader(QMainWindow):
             fmt = "bestvideo+bestaudio/best"
             if quality != "Best":
                 h   = quality.replace("p", "")
-                fmt = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
+                fmt = (
+                f"bestvideo[height<={h}]+bestaudio/"
+                f"bestvideo+bestaudio/"
+                f"best"
+            )
             ydl_opts = {
                 "format": fmt,
                 "outtmpl": os.path.join(download_path, "%(title)s_%(height)sp.%(ext)s"),
                 "merge_output_format": "mkv",
                 "quiet": True, "no_warnings": True,
+                "encoding": "utf-8",                
+                "restrictfilenames": False,            
+                "windowsfilenames": True,  
                 "keepvideo": False,
                 "postprocessors": [
                     {"key": "FFmpegVideoConvertor", "preferedformat": "mkv"},
@@ -2239,17 +2257,17 @@ class VideoDownloader(QMainWindow):
                   else f"{downloaded/1024**3:.2f} / {total/1024**3:.2f} GB")
             self.pl_size_lbl.setText(f"Size: {sz}")
 
-        # Overall
-        total_count = len(self._playlist_entries)
-        if total_count:
-            done = (self.active_playlist_dl.current_index - 1) if self.active_playlist_dl else 0
+        total_count = len(getattr(self, '_pl_selected_indices', self._playlist_entries))
+        
+        if total_count and self.active_playlist_dl:
+            done = self.active_playlist_dl.current_index - 1
             overall = ((done + (downloaded / total if total else 0)) / total_count) * 100
             self.pl_overall_bar.setValue(int(overall))
 
     def on_playlist_video_done(self, index: int, filepath: str):
         # index is 1-based from download thread
         table_row = self._pl_selected_indices[index - 1]
-        status_item = self.pl_table.item(table_row, 3)  # Column 3 = Status
+        status_item = self.pl_table.item(table_row, 3)
         if status_item:
             status_item.setText("✅ Done")
             status_item.setForeground(QColor("#4caf50"))
@@ -2323,7 +2341,7 @@ class VideoDownloader(QMainWindow):
         hdr_lyt.setContentsMargins(10, 10, 10, 10)
         
         ic = QLabel()
-        ic.setPixmap(QPixmap("icon.ico").scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         hdr_lyt.addWidget(ic)
         
         tc = QWidget()
@@ -3019,28 +3037,35 @@ class VideoDownloader(QMainWindow):
     #  4. VIDEO CODEC TAB
     # ══════════════════════════════════════════════════════
 
+    # ══════════════════════════════════════════════════════
+    #  4. VIDEO CODEC TAB
+    # ══════════════════════════════════════════════════════
+
     def setup_codec_tab(self):
+        # Eski bozuk düzen kalıntılarını temizle (Çiftleşmeyi %100 önler)
+        if self.codec_tab.layout():
+            QWidget().setLayout(self.codec_tab.layout())
+
         layout = QVBoxLayout(self.codec_tab)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
 
-        # Header (simplified)
+        # Header
         header = QWidget()
         header.setStyleSheet("QWidget{background-color:#363636;border-radius:8px;padding:8px;}")
         h_lyt = QHBoxLayout(header)
         h_lyt.setContentsMargins(10, 0, 10, 0)
         h_lyt.setSpacing(10)
         ic = QLabel()
-        ic.setPixmap(QPixmap("icon.ico").scaled(32, 32,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation))
+        
+        # İkon sorunu için get_resource_path kullandık
+        ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         h_lyt.addWidget(ic)
         h_lyt.addWidget(_make_label("Video Codec Editor", "color:#fff;font-size:16px;font-weight:bold;"))
-        h_lyt.addWidget(_make_label("Convert video files to different codecs.",
-                                 "color:#b0b0b0;font-size:12px;"), 1)
+        h_lyt.addWidget(_make_label("Convert video files to different codecs.", "color:#b0b0b0;font-size:12px;"), 1)
         layout.addWidget(header)
 
-        # File selection (simplified)
+        # File selection
         file_container = QWidget()
         file_container.setStyleSheet("QWidget{background-color:#363636;border-radius:8px;padding:8px;}")
         fc_lyt = QHBoxLayout(file_container)
@@ -3050,24 +3075,26 @@ class VideoDownloader(QMainWindow):
         self.codec_file_input.setPlaceholderText("Select a video file to convert...")
         self.codec_file_input.setMinimumHeight(36)
         self.codec_file_input.setStyleSheet(_INPUT)
+        
         self.codec_browse_button = QPushButton("Browse")
         self.codec_browse_button.setMinimumHeight(36)
         self.codec_browse_button.setFixedWidth(100)
         self.codec_browse_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.codec_browse_button.setStyleSheet(_BTN_BLUE)
         self.codec_browse_button.clicked.connect(self.browse_codec_file)
+        
         fc_lyt.addWidget(self.codec_file_input)
         fc_lyt.addWidget(self.codec_browse_button)
         layout.addWidget(file_container)
 
-        # Codec options (using QFormLayout for cleaner structure)
+        # Codec options
         codec_container = QGroupBox("🎞  Codec Settings")
         form_layout = QFormLayout(codec_container)
         form_layout.setSpacing(12)
         form_layout.setContentsMargins(10, 10, 10, 10)
 
         self.video_codec_combo = QComboBox()
-        self.video_codec_combo.addItems(["H.264", "H.265", "VP9", "AV1"])
+        self.video_codec_combo.addItems(["Copy (Instant)", "H.264", "H.265", "VP9", "AV1"])
         self.video_codec_combo.setStyleSheet(_COMBO)
         self.video_codec_combo.currentTextChanged.connect(self._on_codec_changed)
         form_layout.addRow("🎥  Video Codec:", self.video_codec_combo)
@@ -3085,9 +3112,16 @@ class VideoDownloader(QMainWindow):
         self.acceleration_mode_combo.setStyleSheet(_COMBO)
         form_layout.addRow("⚡  Acceleration:", self.acceleration_mode_combo)
 
+        # PC'deki en iyi ekran kartını otomatik olarak bul ve listede seçili yap!
+        for pref in["NVIDIA", "AMD", "VAAPI", "Intel"]:
+            match = next((m for m in modes if pref in m), None)
+            if match:
+                self.acceleration_mode_combo.setCurrentText(match)
+                break
+
         self.codec_preset_combo = QComboBox()
         self.codec_preset_combo.addItems(["veryfast", "fast", "medium (balanced)", "slow", "veryslow"])
-        self.codec_preset_combo.setCurrentIndex(2)  # Default to balanced
+        self.codec_preset_combo.setCurrentIndex(1)
         self.codec_preset_combo.setStyleSheet(_COMBO)
         form_layout.addRow("🎚  Preset:", self.codec_preset_combo)
 
@@ -3106,7 +3140,7 @@ class VideoDownloader(QMainWindow):
         self.convert_button.clicked.connect(self.start_conversion)
         layout.addWidget(self.convert_button)
 
-        # Progress (simplified)
+        # Progress
         progress_container = QGroupBox("📊  Conversion Progress")
         prog_lyt = QVBoxLayout(progress_container)
         prog_lyt.setSpacing(10)
@@ -3123,32 +3157,29 @@ class VideoDownloader(QMainWindow):
         self.conversion_time    = QLabel("⏱ Time: --:--:--")
         self.conversion_eta     = QLabel("🕒 ETA: --:--:--")
         self.conversion_percent = QLabel("📊 Progress: 0%")
-        for lbl in (self.conversion_speed, self.conversion_time,
-                    self.conversion_eta, self.conversion_percent):
+        for lbl in (self.conversion_speed, self.conversion_time, self.conversion_eta, self.conversion_percent):
             lbl.setStyleSheet("color:#b0b0b0; font-size:12px;")
             det_lyt.addWidget(lbl, 1)
         prog_lyt.addWidget(det_row)
         layout.addWidget(progress_container)
         layout.addStretch()
 
-
     def _on_codec_changed(self):
-        """Update compatibility hint when codec selection changes."""
         vc = self.video_codec_combo.currentText()
         ac = self.audio_codec_combo.currentText()
         hint = self._get_compat_hint(vc, ac)
         self.compat_hint.setText(hint)
 
     def _get_compat_hint(self, video_codec: str, audio_codec: str) -> str:
-        hints = []
+        hints =[]
         if video_codec == "VP9":
-            hints.append("VP9 requires .webm or .mkv output (not .mp4).")
+            hints.append("VP9 requires .webm or .mkv output.")
         if video_codec == "AV1":
-            hints.append("AV1 is best stored in .mkv (very slow on CPU — use GPU if available).")
+            hints.append("AV1 is best stored in .mkv.")
         if audio_codec == "FLAC":
-            hints.append("FLAC audio is not compatible with .mp4 — output will use .mkv.")
+            hints.append("FLAC audio output will use .mkv.")
         if audio_codec == "Opus":
-            hints.append("Opus audio is not standard in .mp4 — output will use .mkv.")
+            hints.append("Opus audio output will use .mkv.")
         return "  ⚠  " + "  |  ".join(hints) if hints else ""
 
     def _get_best_container(self, video_codec: str, audio_codec: str) -> str:
@@ -3169,168 +3200,108 @@ class VideoDownloader(QMainWindow):
             self._on_codec_changed()
 
     def detect_gpu(self) -> str:
-        if shutil.which("nvidia-smi"):
-            return "NVIDIA"
+        if shutil.which("nvidia-smi"): return "NVIDIA"
         if os.name == "nt":
             try:
-                out = subprocess.check_output(
-                    ["wmic", "path", "win32_VideoController", "get", "Name"],
-                    encoding='utf-8', errors='replace', stderr=subprocess.DEVNULL,
-                )
+                out = subprocess.check_output(["wmic", "path", "win32_VideoController", "get", "Name"], encoding='utf-8', errors='replace', stderr=subprocess.DEVNULL)
                 up = out.upper()
-                if "AMD" in up:
-                    return "AMD_APU" if "APU" in up else "AMD"
-            except Exception:
-                pass
-        # Linux: try vainfo for Intel QSV / AMD VAAPI
-        if shutil.which("vainfo"):
-            return "VAAPI"
+                if "AMD" in up: return "AMD_APU" if "APU" in up else "AMD"
+            except: pass
+        if shutil.which("vainfo"): return "VAAPI"
         return "CPU"
 
     def get_available_acceleration_modes(self) -> list:
-        modes = ["CPU"]
-        if shutil.which("nvidia-smi"):
-            modes.append("NVIDIA (NVENC)")
+        modes =["CPU"]
+        if shutil.which("nvidia-smi"): modes.append("NVIDIA (NVENC)")
         if os.name == "nt":
             try:
-                out = subprocess.check_output(
-                    ["wmic", "path", "win32_VideoController", "get", "Name"],
-                    encoding='utf-8', errors='replace', stderr=subprocess.DEVNULL,
-                ).upper()
-                if "AMD" in out:
-                    modes.append("AMD APU (AMF)" if "APU" in out else "AMD (AMF)")
-            except Exception:
-                pass
-        if shutil.which("vainfo"):
-            modes.append("Intel/AMD (VAAPI)")
+                out = subprocess.check_output(["wmic", "path", "win32_VideoController", "get", "Name"], encoding='utf-8', errors='replace', stderr=subprocess.DEVNULL).upper()
+                if "AMD" in out: modes.append("AMD APU (AMF)" if "APU" in out else "AMD (AMF)")
+            except: pass
+        if shutil.which("vainfo"): modes.append("Intel/AMD (VAAPI)")
         return modes
 
     def start_conversion(self):
+        self.convert_button.setEnabled(False) # Korumaya aldık
+
         input_file = self.codec_file_input.text().strip()
         if not input_file or not os.path.exists(input_file):
             QMessageBox.warning(self, "Error", "Please select a valid video file.")
+            self.convert_button.setEnabled(True)
             return
 
-        # Check FFmpeg
         if not shutil.which("ffmpeg"):
-            QMessageBox.warning(self, "Error",
-                "FFmpeg is not installed. Please install it from the Settings tab.")
+            QMessageBox.warning(self, "Error", "FFmpeg is not installed.")
+            self.convert_button.setEnabled(True)
             return
 
-        # Verify input file is readable / not zero-length
         if os.path.getsize(input_file) == 0:
             QMessageBox.warning(self, "Error", "Selected file is empty.")
+            self.convert_button.setEnabled(True)
             return
 
-        # Codec maps
-        video_codec_map = {
-            "H.264":  "libx264",
-            "H.265":  "libx265",
-            "VP9":    "libvpx-vp9",
-            "AV1":    "libaom-av1",
-        }
-        audio_codec_map = {
-            "AAC":   "aac",
-            "MP3":   "libmp3lame",
-            "Opus":  "libopus",
-            "FLAC":  "flac",
-            "Copy":  "copy",
-        }
+        video_codec_map = {"H.264": "libx264", "H.265": "libx265", "VP9": "libvpx-vp9", "AV1": "libaom-av1"}
+        audio_codec_map = {"AAC": "aac", "MP3": "libmp3lame", "Opus": "libopus", "FLAC": "flac", "Copy": "copy"}
         
-        # Optimized preset mapping (faster presets with good quality)
-        preset_map_cpu = {
-            "veryfast":         "superfast",
-            "fast":             "fast",
-            "medium (balanced)":"medium",
-            "slow":             "slow",
-            "veryslow":         "veryslow",
-        }
-        preset_map_hwenc = {
-            "veryfast":         "p1",   # Fastest
-            "fast":             "p2",
-            "medium (balanced)":"p3",   # Balanced
-            "slow":             "p4",
-            "veryslow":         "p5",   # Slowest but best quality
-        }
+        preset_map_hwenc = {"veryfast": "p1", "fast": "p2", "medium (balanced)": "p3", "slow": "p4", "veryslow": "p5"}
+        preset_map_cpu = {"veryfast": "superfast", "fast": "fast", "medium (balanced)": "medium", "slow": "slow", "veryslow": "veryslow"}
         
-        acc_mode    = self.acceleration_mode_combo.currentText()
-        cur_vc      = self.video_codec_combo.currentText()
-        cur_ac      = self.audio_codec_combo.currentText()
-        preset_raw  = self.codec_preset_combo.currentText()
+        acc_mode = self.acceleration_mode_combo.currentText()
+        cur_vc = self.video_codec_combo.currentText()
+        cur_ac = self.audio_codec_combo.currentText()
+        preset_raw = self.codec_preset_combo.currentText()
 
-        # CPU codec (also used as fallback)
-        cpu_video_codec = video_codec_map.get(cur_vc, "libx264")
-        audio_codec     = audio_codec_map.get(cur_ac, "aac")
-
-        # Hardware encoder selection with optimized settings
         extra_params = []
-        if "NVIDIA" in acc_mode:
-            hw_map  = {"H.264": "h264_nvenc", "H.265": "hevc_nvenc"}
-            video_codec = hw_map.get(cur_vc, cpu_video_codec)
-            # NVIDIA NVENC optimizations
-            extra_params = ["-rc:v", "vbr", "-cq:v", "23"]  # VBR with quality focus
-            if cur_vc == "H.265":
-                extra_params += ["-preset:v", preset_map_hwenc.get(preset_raw, "p3")]
-            else:
-                extra_params += ["-preset:v", preset_map_hwenc.get(preset_raw, "p3")]
-        elif "AMD" in acc_mode:
-            hw_map  = {"H.264": "h264_amf", "H.265": "hevc_amf"}
-            video_codec = hw_map.get(cur_vc, cpu_video_codec)
-            # AMD AMF optimizations
-            extra_params = ["-quality", "balanced"]  # or "speed" for faster
-        elif "VAAPI" in acc_mode:
-            hw_map  = {"H.264": "h264_vaapi", "H.265": "hevc_vaapi"}
-            video_codec = hw_map.get(cur_vc, cpu_video_codec)
-            # Intel QSV / AMD VAAPI
-            extra_params = ["-low_power", "0"]
+        hwaccel_input_args =[]
+        cpu_video_codec = ""
+
+        audio_codec = audio_codec_map.get(cur_ac, "aac")
+
+        if "Copy" in cur_vc:
+            video_codec = "copy"
+            best_ext = self._get_best_container("copy", audio_codec)
+            # DÜZELTİLDİ: MKV içindeki resmi/altyazıyı at, sadece video+ses'i kopyala
+            extra_params =["-sn", "-map", "0:v:0", "-map", "0:a?"]
         else:
-            video_codec = cpu_video_codec
-            cpu_video_codec = ""   # no fallback needed for CPU
-            # CPU codec optimizations
-            if cur_vc in ("H.264", "H.265"):
-                preset_val = preset_map_cpu.get(preset_raw, "medium")
+            cpu_video_codec = video_codec_map.get(cur_vc, "libx264")
+            
+            if "CPU" not in acc_mode:
+                hwaccel_input_args = ["-hwaccel", "auto"]
+
+            if "NVIDIA" in acc_mode:
+                hw_map = {"H.264": "h264_nvenc", "H.265": "hevc_nvenc"}
+                video_codec = hw_map.get(cur_vc, cpu_video_codec)
+                extra_params =["-rc:v", "vbr", "-cq:v", "23", "-preset:v", preset_map_hwenc.get(preset_raw, "p3")]
+            elif "AMD" in acc_mode:
+                hw_map = {"H.264": "h264_amf", "H.265": "hevc_amf"}
+                video_codec = hw_map.get(cur_vc, cpu_video_codec)
+                extra_params =["-quality", "speed" if "fast" in preset_raw else "balanced"]
+            elif "VAAPI" in acc_mode:
+                hw_map = {"H.264": "h264_vaapi", "H.265": "hevc_vaapi"}
+                video_codec = hw_map.get(cur_vc, cpu_video_codec)
+                extra_params = ["-low_power", "0"]
+            else:
+                video_codec = cpu_video_codec
+                cpu_video_codec = "" 
+                preset_val = preset_map_cpu.get(preset_raw, "fast")
                 extra_params = ["-preset", preset_val, "-crf", "23"]
 
-        # Determine best output container
-        best_ext        = self._get_best_container(cpu_video_codec, audio_codec)
-        in_base, in_ext = os.path.splitext(input_file)
-        in_dir          = os.path.dirname(input_file)
-        acc_tag         = "_gpu" if acc_mode != "CPU" else ""
-        suggested_name  = (f"{os.path.basename(in_base)}"
-                           f"_{cur_vc}_{cur_ac}{acc_tag}{best_ext}")
-        suggested_out   = os.path.join(in_dir, suggested_name)
+            best_ext = self._get_best_container(cpu_video_codec or video_codec, audio_codec)
 
-        filter_str = "Video Files (*.mp4 *.mkv *.webm *.avi);;All Files (*.*)"
-        output_file, _ = QFileDialog.getSaveFileName(
-            self, "Save Converted File", suggested_out, filter_str
-        )
+        in_base, in_ext = os.path.splitext(input_file)
+        in_dir = os.path.dirname(input_file)
+        acc_tag = "_gpu" if acc_mode != "CPU" and "Copy" not in cur_vc else ""
+        v_tag = "Copy" if "Copy" in cur_vc else cur_vc
+        suggested_name = f"{os.path.basename(in_base)}_{v_tag}_{cur_ac}{acc_tag}{best_ext}"
+        suggested_out = os.path.join(in_dir, suggested_name)
+
+        output_file, _ = QFileDialog.getSaveFileName(self, "Save Converted File", suggested_out, "Video Files (*.mp4 *.mkv *.webm *.avi);;All Files (*.*)")
+        
+        # Kullanıcı 'İptal' derse Convert tuşunu geri aç
         if not output_file:
+            self.convert_button.setEnabled(True)
             return
 
-        # Warn if user chose a container that may be incompatible
-        out_ext = os.path.splitext(output_file)[1].lower()
-        if cpu_video_codec == "libvpx-vp9" and out_ext == ".mp4":
-            reply = QMessageBox.warning(
-                self, "Container Warning",
-                "VP9 in .mp4 is not widely supported.\n"
-                "Consider saving as .webm or .mkv instead.\n\n"
-                "Continue anyway?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-        if audio_codec == "flac" and out_ext == ".mp4":
-            reply = QMessageBox.warning(
-                self, "Container Warning",
-                "FLAC audio is incompatible with .mp4.\n"
-                "Please save as .mkv.\n\n"
-                "Continue anyway?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-
-        self.convert_button.setEnabled(False)
         self.convert_button.setText("Converting...")
         self.codec_progress.setValue(0)
 
@@ -3339,6 +3310,7 @@ class VideoDownloader(QMainWindow):
             video_codec, audio_codec,
             extra_params,
             cpu_fallback_video=cpu_video_codec,
+            hwaccel_input_args=hwaccel_input_args
         )
         self.conversion_thread.progress_signal.connect(self.update_conversion_progress)
         self.conversion_thread.finished_signal.connect(self.conversion_finished)
@@ -3657,7 +3629,7 @@ class VideoDownloader(QMainWindow):
         h_lyt.setContentsMargins(0, 0, 0, 0)
         ic = QLabel()
         ic.setPixmap(
-            QPixmap("icon.ico").scaled(
+            QPixmap(get_resource_path("icon.ico")).scaled(
                 32, 32,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
