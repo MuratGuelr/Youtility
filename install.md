@@ -1,1 +1,3 @@
 pyinstaller --noconsole --onefile --hidden-import=yt_dlp --hidden-import=PyQt6 --name "Youtility" --icon=icon.ico --add-data "icon.ico;." --windowed main-en.py
+
+pyinstaller --noconsole --onefile --hidden-import=yt_dlp --hidden-import=yt_dlp.extractor --hidden-import=yt_dlp.extractor.youtube --hidden-import=yt_dlp.utils --hidden-import=yt_dlp.networking --hidden-import=yt_dlp.networking.impersonate --hidden-import=websockets --hidden-import=certifi --hidden-import=urllib3 --hidden-import=requests --hidden-import=PyQt6 --hidden-import=PyQt6.QtCore --hidden-import=PyQt6.QtWidgets --hidden-import=PyQt6.QtGui --collect-all yt_dlp --name "Youtility" --icon=icon.ico --add-data "icon.ico;." --windowed main-en.py
