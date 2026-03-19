@@ -4,6 +4,13 @@ Features: Video download, playlist, live stream, codec conversion, history
 """
 
 import sys
+
+if len(sys.argv) >= 3 and sys.argv[1] == "-m" and sys.argv[2] == "yt_dlp":
+    import yt_dlp
+    sys.argv = [sys.argv[0]] + sys.argv[3:]
+    sys.exit(yt_dlp.main())
+
+
 import os
 import shutil
 import json
@@ -28,7 +35,7 @@ from PyQt6.QtWidgets import (
     QScrollArea
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QPixmap, QColor, QIcon
+from PyQt6.QtGui import QPalette, QPixmap, QColor, QIcon
 
 
 # ─────────────────────────────────────────────────────────
@@ -437,6 +444,13 @@ class LiveStreamThread(QThread):
         r"(?:\s*\(frag\s+(\d+)/(\d+)\))?",
         re.IGNORECASE,
     )
+
+    _STD_PROG_RE = re.compile(
+    r"\[download\]\s+([\d.]+)%\s+of\s+~?([\d.]+)(KiB|MiB|GiB|B)"
+    r"\s+at\s+([\d.]+)(KiB|MiB|GiB|B)/s"
+    r"(?:\s+ETA\s+([\d:]+))?",
+    re.IGNORECASE,
+)
     _MERGE_RE  = re.compile(r"\[ffmpeg\]|Merging", re.IGNORECASE)
     # Matches --print "after_move:%(title)s	%(id)s	%(filepath)s"
     _PRINT_RE  = re.compile(r"^(.+)	([A-Za-z0-9_-]+)	(.+)$")
@@ -506,6 +520,45 @@ class LiveStreamThread(QThread):
                 elif self._MERGE_RE.search(line):
                     self.status_signal.emit("merging")
 
+                else:
+                    std = self._STD_PROG_RE.search(line)
+                    if std:
+                        pct        = float(std.group(1))
+                        total_val  = float(std.group(2))
+                        total_unit = std.group(3).upper()
+                        spd_val    = float(std.group(4))
+                        spd_unit   = std.group(5).upper()
+                        eta_str    = std.group(6) or ""
+
+                        total_bytes = self._to_bytes(total_val, total_unit)
+                        spd_bytes   = self._to_bytes(spd_val,   spd_unit)
+                        done_bytes  = total_bytes * (pct / 100.0)
+
+                        # ETA string → saniyeye çevir
+                        eta_secs = 0
+                        if eta_str:
+                            parts = eta_str.split(":")
+                            try:
+                                if len(parts) == 3:
+                                    eta_secs = int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+                                elif len(parts) == 2:
+                                    eta_secs = int(parts[0])*60 + int(parts[1])
+                                else:
+                                    eta_secs = int(parts[0])
+                            except Exception:
+                                pass
+
+                        self.progress_signal.emit({
+                            "stream_id":   1,
+                            "downloaded":  done_bytes,
+                            "speed":       spd_bytes,
+                            "frag_idx":    int(pct),      # % değerini frag_idx olarak kullanıyoruz
+                            "frag_count":  100,           # sabit 100 → progress bar % gösterir
+                            "pct":         pct,
+                            "eta_secs":    eta_secs,
+                            "total_bytes": total_bytes,
+                        })
+
             ret = self._proc.wait()
             if self.is_cancelled:
                 return
@@ -565,13 +618,30 @@ class LiveStreamThread(QThread):
         if self._proc and self._proc.poll() is None:
             if os.name == "nt":
                 try:
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
                         capture_output=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW
                     )
                 except Exception:
                     self._proc.terminate()
             else:
+                import signal as _sig
+                try:
+                    self._proc.send_signal(_sig.SIGTERM)
+                except Exception:
+                    self._proc.terminate()
+        self.is_cancelled = True
+        if self._proc and self._proc.poll() is None:
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
+                        capture_output=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                except Exception:
+                    self._proc.terminate()
+        else:
                 import signal as _sig
                 try:
                     self._proc.send_signal(_sig.SIGTERM)
@@ -820,7 +890,7 @@ class VideoDownloader(QMainWindow):
 
     # ── Tabs ──────────────────────────────────────────────
     def init_ui(self):
-        self.setMinimumSize(750, 680)
+        self.setMinimumSize(715, 700)
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
@@ -855,178 +925,127 @@ class VideoDownloader(QMainWindow):
     # ══════════════════════════════════════════════════════
 
     def setup_youtube_tab(self):
+        if self.youtube_tab.layout():
+            QWidget().setLayout(self.youtube_tab.layout())
+
         layout = QVBoxLayout(self.youtube_tab)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
 
         # FFmpeg warning banner
         self.ffmpeg_warning_banner = QWidget()
-        self.ffmpeg_warning_banner.setStyleSheet(
-            "QWidget { border-radius:4px; padding:10px; margin-bottom:10px; }"
-        )
+        self.ffmpeg_warning_banner.setStyleSheet("QWidget { border-radius:4px; padding:10px; margin-bottom:10px; }")
         banner_layout = QHBoxLayout(self.ffmpeg_warning_banner)
         banner_layout.setContentsMargins(10, 10, 10, 10)
         w_txt = QLabel("⚠️  FFmpeg is not installed. It is required for video downloading.")
         w_txt.setStyleSheet("color:#fff; font-size:13px; border:1px solid #404040;")
         banner_layout.addWidget(w_txt)
         inst_btn = QPushButton("Install FFmpeg")
-        inst_btn.setStyleSheet(
-            "QPushButton{background:#cf0000;color:white;border:none;border-radius:4px;"
-            "padding:10px 15px;font-size:12px;font-weight:bold;}"
-            "QPushButton:hover{background:#e30202;}"
-        )
+        inst_btn.setStyleSheet("QPushButton{background:#cf0000;color:white;border:none;border-radius:4px;padding:10px 15px;font-size:12px;font-weight:bold;} QPushButton:hover{background:#e30202;}")
         inst_btn.clicked.connect(self.download_ffmpeg)
         banner_layout.addWidget(inst_btn)
         layout.addWidget(self.ffmpeg_warning_banner)
         self.ffmpeg_warning_banner.hide()
 
-        # Hero area (logo + URL input)
-        main_container = QWidget()
-        main_layout    = QVBoxLayout(main_container)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(30)
+        # 1. HEADER CARD (Sabit ve Şık)
+        header = QWidget()
+        header.setStyleSheet("QWidget{background-color:#363636; border-radius:8px; padding:8px;}")
+        hdr_lyt = QHBoxLayout(header)
+        hdr_lyt.setContentsMargins(10, 0, 10, 0)
+        hdr_lyt.setSpacing(10)
+        ic = QLabel()
+        ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        hdr_lyt.addWidget(ic)
+        hdr_lyt.addWidget(_make_label("YouTube Downloader", "color:#fff; font-size:16px; font-weight:bold;"))
+        hdr_lyt.addWidget(_make_label("Download single videos and audio.", "color:#b0b0b0; font-size:12px;"), 1)
+        layout.addWidget(header)
 
-        self.url_wrapper        = QWidget()
-        self.url_wrapper_layout = QVBoxLayout(self.url_wrapper)
-        self.url_wrapper_layout.setContentsMargins(0, 50, 0, 50)
-
-        # Logo + title
-        self.logo_container = QWidget()
-        logo_layout = QVBoxLayout(self.logo_container)
-        logo_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        logo_lbl = QLabel()
-        logo_px  = QPixmap(get_resource_path("icon.ico")).scaled(
-            128, 128,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        logo_lbl.setPixmap(logo_px)
-        logo_layout.addWidget(logo_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        title_lbl = QLabel("Download YouTube Video")
-        title_lbl.setStyleSheet("color:#fff; font-size:24px; font-weight:bold; margin-top:10px;")
-        logo_layout.addWidget(title_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        sub_lbl = QLabel("Paste a YouTube link to get started.")
-        sub_lbl.setStyleSheet("color:#b0b0b0; font-size:14px;")
-        logo_layout.addWidget(sub_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        self.url_wrapper_layout.addWidget(self.logo_container)
-
-        # URL input row
-        self.url_container = QWidget()
-        self.url_container.setStyleSheet(
-            "QWidget{background-color:#363636;border-radius:8px;padding:20px;}"
-        )
-        url_row = QHBoxLayout(self.url_container)
-        url_row.setContentsMargins(10, 10, 10, 10)
-        url_row.setSpacing(8)
-
+        # 2. INPUT CARD
+        source_card = QWidget()
+        source_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        src_lyt = QVBoxLayout(source_card)
+        src_lyt.setContentsMargins(15, 15, 15, 15)
+        
+        input_row = QHBoxLayout()
+        input_row.setSpacing(10)
+        
         self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText(
-            "Copy the YouTube video link then press 'Paste'."
-        )
-        self.url_input.setMinimumHeight(45)
+        self.url_input.setPlaceholderText("Paste a YouTube video link...")
+        self.url_input.setMinimumHeight(40)
         self.url_input.setStyleSheet(_INPUT)
         self.url_input.returnPressed.connect(self._on_enter_pressed)
-
+        
         self.paste_button = QPushButton("Paste")
-        self.paste_button.setMinimumHeight(45)
+        self.paste_button.setMinimumHeight(40)
         self.paste_button.setFixedWidth(120)
-        self.paste_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.paste_button.setStyleSheet(_BTN_BLUE)
         self.paste_button.clicked.connect(self.paste_url)
+        
+        input_row.addWidget(self.url_input)
+        input_row.addWidget(self.paste_button)
+        src_lyt.addLayout(input_row)
+        layout.addWidget(source_card)
 
-        url_row.addWidget(self.url_input)
-        url_row.addWidget(self.paste_button)
-        self.url_wrapper_layout.addWidget(self.url_container)
-
-        main_layout.addWidget(self.url_wrapper)
-        layout.addWidget(main_container)
-
-        # Video info container (hidden until URL fetched)
+        # 3. VIDEO INFO CARD
         self.video_info_container = QWidget()
+        self.video_info_container.setStyleSheet("QWidget#vi_card {background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;}")
+        self.video_info_container.setObjectName("vi_card")
         vi_layout = QVBoxLayout(self.video_info_container)
-        vi_layout.setContentsMargins(0, 0, 0, 0)
-        vi_layout.setSpacing(15)
+        vi_layout.setContentsMargins(5, 5, 5, 5)
+        vi_layout.setSpacing(1)
 
-        # Thumbnail + metadata row
-        info_row        = QWidget()
-        info_row_layout = QHBoxLayout(info_row)
-        info_row_layout.setContentsMargins(0, 0, 0, 0)
-        info_row_layout.setSpacing(15)
-
-        # Left: thumbnail
-        left_panel = QWidget()
-        left_panel.setFixedWidth(320)
-        left_lyt = QVBoxLayout(left_panel)
-        left_lyt.setContentsMargins(0, 0, 0, 0)
-        left_lyt.setSpacing(8)
-
+        # -- Thumbnail & Meta
+        info_row = QHBoxLayout()
+        info_row.setSpacing(5)
+        
+        left_panel = QVBoxLayout()
         self.thumbnail_label = QLabel()
         self.thumbnail_label.setFixedSize(320, 180)
-        self.thumbnail_label.setStyleSheet("border:1px solid #3a3a3a; border-radius:4px;")
+        self.thumbnail_label.setStyleSheet("border:1px solid #3d3d3d; border-radius:6px; background-color:#1e1e1e;")
         self.thumbnail_label.setScaledContents(True)
-
+        
         self.download_thumbnail_btn = QPushButton("⬇ Download Thumbnail")
         self.download_thumbnail_btn.setFixedWidth(320)
         self.download_thumbnail_btn.setStyleSheet(_BTN_BLUE)
         self.download_thumbnail_btn.clicked.connect(self.download_thumbnail)
+        
+        left_panel.addWidget(self.thumbnail_label)
+        left_panel.addWidget(self.download_thumbnail_btn)
+        info_row.addLayout(left_panel)
 
-        left_lyt.addWidget(self.thumbnail_label)
-        left_lyt.addWidget(self.download_thumbnail_btn)
-        info_row_layout.addWidget(left_panel)
-
-        # Right: metadata
-        right_panel = QWidget()
-        right_lyt   = QVBoxLayout(right_panel)
-        right_lyt.setContentsMargins(0, 0, 0, 0)
-        right_lyt.setSpacing(12)
-
-        _stat_style = """
-            QLabel {
-                color:#e0e0e0; font-size:13px; padding:8px 12px;
-                background-color:#2d2d2d; border-radius:6px;
-                border:1px solid #3d3d3d;
-            }
-        """
-        self.title_label       = QLabel()
+        right_panel = QVBoxLayout()
+        right_panel.setSpacing(5)
+        
+        self.title_label = QLabel()
         self.title_label.setWordWrap(True)
-        self.title_label.setStyleSheet(
-            "QLabel{color:#fff;font-size:15px;font-weight:bold;"
-            "padding:8px 12px;background-color:#2d2d2d;"
-            "border-radius:6px;border:1px solid #3d3d3d;}"
-        )
-        self.channel_label     = QLabel()
-        self.channel_label.setStyleSheet(
-            "QLabel{color:#8721fc;font-size:14px;font-weight:bold;"
-            "padding:8px 12px;background-color:#2d2d2d;"
-            "border-radius:6px;border:1px solid #3d3d3d;}"
-        )
-        self.duration_label    = QLabel()
+        self.title_label.setStyleSheet("color:#fff; font-size:13px; font-weight:bold; padding:8px 12px; background-color:#363636; border-radius:6px; border:1px solid #404040;")
+        
+        self.channel_label = QLabel()
+        self.channel_label.setStyleSheet("color:#8721fc; font-size:12px; font-weight:bold; padding:8px 12px; background-color:#363636; border-radius:6px; border:1px solid #404040;")
+        
+        _stat_style = "color:#e0e0e0; font-size:12px; padding:8px 12px; background-color:#363636; border-radius:6px; border:1px solid #404040;"
+        self.duration_label = QLabel()
         self.duration_label.setStyleSheet(_stat_style)
-        self.views_label       = QLabel()
+        self.views_label = QLabel()
         self.views_label.setStyleSheet(_stat_style)
         self.upload_date_label = QLabel()
         self.upload_date_label.setStyleSheet(_stat_style)
 
-        right_lyt.addWidget(self.title_label)
-        right_lyt.addWidget(self.channel_label)
-        right_lyt.addWidget(self.duration_label)
-        right_lyt.addWidget(self.views_label)
-        right_lyt.addWidget(self.upload_date_label)
-        right_lyt.addStretch()
-        info_row_layout.addWidget(right_panel)
-        vi_layout.addWidget(info_row)
+        right_panel.addWidget(self.title_label)
+        right_panel.addWidget(self.channel_label)
+        right_panel.addWidget(self.duration_label)
+        right_panel.addWidget(self.views_label)
+        right_panel.addWidget(self.upload_date_label)
+        right_panel.addStretch()
+        
+        info_row.addLayout(right_panel)
+        vi_layout.addLayout(info_row)
 
-        # Format table
+        # -- Format Table (Modern Stil)
         self.format_table = QTableWidget()
         self.format_table.setMinimumHeight(150)
         self.format_table.setColumnCount(5)
-        self.format_table.setHorizontalHeaderLabels(
-            ["Quality", "Format", "Resolution", "FPS", "Size"]
-        )
+        self.format_table.setHorizontalHeaderLabels(["Quality", "Format", "Resolution", "FPS", "Size"])
         hdr = self.format_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -1034,132 +1053,123 @@ class VideoDownloader(QMainWindow):
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.format_table.verticalHeader().setVisible(False)
-        self.format_table.setShowGrid(True)
+        self.format_table.setShowGrid(False)
         self.format_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.format_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.format_table.setStyleSheet("""
+            QTableWidget { background-color: #242424; border: 1px solid #3d3d3d; border-radius: 6px; outline: none; }
+            QTableWidget::item { border-bottom: 1px solid #333333; padding: 4px; }
+            QTableWidget::item:selected { background-color: #1976d2; }
+            QHeaderView::section { background-color: #2d2d2d; color: #90caf9; padding: 6px; border: none; border-bottom: 2px solid #1976d2; font-size: 13px; font-weight: bold; }
+        """)
+        self.format_table.itemSelectionChanged.connect(self.update_download_button)
         vi_layout.addWidget(self.format_table)
 
-        # Format table'dan sonra, btn_row'dan önce:
-        time_row = QWidget()
-        time_lyt = QHBoxLayout(time_row)
-        time_lyt.setContentsMargins(0, 0, 0, 0)
-        time_lyt.setSpacing(8)
-
+        # -- Time Range
+        time_row = QHBoxLayout()
         self.yt_time_range_cb = QCheckBox("Download specific time range")
-        self.yt_time_range_cb.setStyleSheet("color:#b0b0b0; font-size:12px;")
-        time_lyt.addWidget(self.yt_time_range_cb)
+        self.yt_time_range_cb.setStyleSheet("color:#b0b0b0; font-size:13px; font-weight:bold;")
+        time_row.addWidget(self.yt_time_range_cb)
 
         self.yt_start_time = QLineEdit()
         self.yt_start_time.setPlaceholderText("00:00:00")
         self.yt_start_time.setFixedWidth(80)
         self.yt_start_time.setStyleSheet(_INPUT)
         self.yt_start_time.hide()
-        time_lyt.addWidget(self.yt_start_time)
+        time_row.addWidget(self.yt_start_time)
 
         self.yt_end_time = QLineEdit()
         self.yt_end_time.setPlaceholderText("00:00:00")
         self.yt_end_time.setFixedWidth(80)
         self.yt_end_time.setStyleSheet(_INPUT)
         self.yt_end_time.hide()
-        time_lyt.addWidget(self.yt_end_time)
-        time_lyt.addStretch()
-        vi_layout.addWidget(time_row)
+        time_row.addWidget(self.yt_end_time)
+        time_row.addStretch()
+        vi_layout.addLayout(time_row)
 
-        # Checkbox toggle
         self.yt_time_range_cb.toggled.connect(lambda checked: (
             self.yt_start_time.show() if checked else self.yt_start_time.hide(),
             self.yt_end_time.show()   if checked else self.yt_end_time.hide(),
         ))
 
-        # Download buttons
-        btn_row = QWidget()
-        btn_lyt = QHBoxLayout(btn_row)
-        btn_lyt.setContentsMargins(0, 0, 0, 0)
-        btn_lyt.setSpacing(10)
-
-        self.download_button     = QPushButton("⬇ Download Video")
+        # -- Download Buttons
+        btn_lyt = QHBoxLayout()
+        self.download_button = QPushButton("⬇ Download Video")
         self.mp3_download_button = QPushButton("🎵 Download MP3")
         for b in (self.download_button, self.mp3_download_button):
-            b.setMinimumHeight(36)
-            b.setStyleSheet(_BTN_BLUE)
+            b.setMinimumHeight(42)
+            b.setStyleSheet(_BTN_BLUE + "font-size:14px;")
+        
+        self.cancel_button = QPushButton("⏹ Cancel")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setMinimumHeight(42)
+        self.cancel_button.setFixedWidth(100)
+        self.cancel_button.setStyleSheet(_BTN_RED + "font-size:14px;")
+        self.cancel_button.clicked.connect(self.cancel_download)
+
         self.download_button.clicked.connect(lambda: self.start_download(mp3_only=False))
         self.mp3_download_button.clicked.connect(lambda: self.start_download(mp3_only=True))
         self.download_button.setEnabled(False)
+        
         btn_lyt.addWidget(self.download_button)
         btn_lyt.addWidget(self.mp3_download_button)
-        vi_layout.addWidget(btn_row)
+        btn_lyt.addWidget(self.cancel_button)
+        vi_layout.addLayout(btn_lyt)
 
-        # Progress section
-        self.progress_container = QWidget()
-        prog_lyt = QVBoxLayout(self.progress_container)
-        prog_lyt.setContentsMargins(0, 0, 0, 0)
+        # -- Progress Section (Modern)
+        prog_lyt = QVBoxLayout()
         prog_lyt.setSpacing(5)
-
-        prog_row     = QWidget()
-        prog_row_lyt = QHBoxLayout(prog_row)
-        prog_row_lyt.setContentsMargins(0, 0, 0, 0)
-        prog_row_lyt.setSpacing(10)
+        
+        self.download_percent = QLabel("Progress: 0%")
+        self.download_percent.setStyleSheet("color:#e0e0e0; font-size:13px; font-weight:bold;")
+        prog_lyt.addWidget(self.download_percent)
 
         self.download_progress = QProgressBar()
-        self.download_progress.setMinimumHeight(25)
+        self.download_progress.setMinimumHeight(18)
+        self.download_progress.setStyleSheet("""
+            QProgressBar { border: none; background-color: #3a3a3a; border-radius: 9px; color: white; text-align: center; font-size: 11px; font-weight: bold;} 
+            QProgressBar::chunk { background-color: #2196f3; border-radius: 9px; }
+        """)
+        prog_lyt.addWidget(self.download_progress)
 
-        self.cancel_button = QPushButton("⏹ Cancel")
-        self.cancel_button.setEnabled(False)
-        self.cancel_button.setFixedWidth(100)
-        self.cancel_button.setStyleSheet(_BTN_RED)
-        self.cancel_button.clicked.connect(self.cancel_download)
-
-        prog_row_lyt.addWidget(self.download_progress)
-        prog_row_lyt.addWidget(self.cancel_button)
-        prog_lyt.addWidget(prog_row)
-
-        details_row = QWidget()
-        det_lyt     = QHBoxLayout(details_row)
-        det_lyt.setContentsMargins(0, 0, 0, 0)
-
-        self.download_speed   = QLabel("Speed: -- MB/s")
-        self.download_eta     = QLabel("Remaining: --:--:--")
-        self.download_size    = QLabel("Size: -- MB / -- MB")
-        self.download_percent = QLabel("Progress: 0%")
-        for lbl in (self.download_speed, self.download_eta,
-                    self.download_size, self.download_percent):
-            lbl.setStyleSheet("color:#b0b0b0; font-size:12px;")
+        det_lyt = QHBoxLayout()
+        self.download_speed = QLabel("Speed: --")
+        self.download_eta = QLabel("Remaining: --")
+        self.download_size = QLabel("Size: --")
+        for lbl in (self.download_speed, self.download_eta, self.download_size):
+            lbl.setStyleSheet("color:#b0b0b0; font-size:12px; font-weight:bold;")
             det_lyt.addWidget(lbl)
+        det_lyt.addStretch()
+        prog_lyt.addLayout(det_lyt)
 
-        prog_lyt.addWidget(details_row)
-        vi_layout.addWidget(self.progress_container)
+        vi_layout.addLayout(prog_lyt)
 
         layout.addWidget(self.video_info_container)
         self.video_info_container.hide()
         layout.addStretch()
 
-        # Signals
-        self.format_table.itemSelectionChanged.connect(self.update_download_button)
-        self.url_input.textChanged.connect(self.on_url_changed)
 
-    # ── YouTube helpers ────────────────────────────────────
-
-    def update_download_button(self):
-        self.download_button.setEnabled(
-            len(self.format_table.selectedItems()) > 0
-        )
+    # ── YouTube Helpers ────────────────────────────────────
 
     def paste_url(self):
         try:
-            clipboard = QApplication.clipboard()
-            text = clipboard.text().strip()
-            if not text:
+            clipboard_text = QApplication.clipboard().text().strip()
+            if clipboard_text and "http" in clipboard_text:
+                self.url_input.setText(clipboard_text)
+                
+            current_text = self.url_input.text().strip()
+            if not current_text:
+                QMessageBox.warning(self, "Error", "Please enter a valid YouTube link in the box or paste one.")
                 return
-            self.url_input.setText(text)
-            # If URL contains a playlist list= param, redirect to Playlist tab
-            if self._url_has_playlist(text):
-                self.pl_url_input.setText(text)
+                
+            if self._url_has_playlist(current_text):
+                self.pl_url_input.setText(current_text)
                 self.tabs.setCurrentWidget(self.playlist_tab)
                 self.fetch_playlist_info()
             else:
-                self._start_info_fetch(text)
+                self._start_info_fetch(current_text)
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Could not read clipboard: {e}")
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred:\n{e}")
 
     def _on_enter_pressed(self):
         url = self.url_input.text().strip()
@@ -1171,6 +1181,12 @@ class VideoDownloader(QMainWindow):
             self.fetch_playlist_info()
         else:
             self._start_info_fetch(url)
+            
+
+    def reset_url_view(self):
+        self.paste_button.setText("Paste")
+        self.paste_button.setEnabled(True)
+        self.video_info_container.hide()
 
     @staticmethod
     def _url_has_playlist(url: str) -> bool:
@@ -1181,7 +1197,9 @@ class VideoDownloader(QMainWindow):
             return "list" in params
         except Exception:
             return False
-
+        
+    
+    
     def on_url_changed(self):
         """Only update the UI layout; do NOT auto-fetch on every keystroke."""
         url = self.url_input.text().strip()
@@ -1248,6 +1266,10 @@ class VideoDownloader(QMainWindow):
         self.paste_button.setText("Paste")
         self.paste_button.setEnabled(True)
         self.video_info_container.hide()
+
+    def update_download_button(self):
+        if hasattr(self, 'download_button') and hasattr(self, 'format_table'):
+            self.download_button.setEnabled(len(self.format_table.selectedItems()) > 0)
 
     def update_video_info(self, info: dict):
         self.video_info_container.show()
@@ -1344,7 +1366,6 @@ class VideoDownloader(QMainWindow):
             height = f.get("height", 0) or 0
             width  = f.get("width",  0) or 0
 
-            # Hem genişliği hem yüksekliği kontrol et
             if width >= 7680 or height >= 4320:
                 q_text = "8K"
             elif width >= 3840 or height >= 2160:
@@ -1389,11 +1410,9 @@ class VideoDownloader(QMainWindow):
         if not hasattr(self, "current_thumbnail_url") or not self.current_thumbnail_url:
             return
         try:
-            # title_label yerine info'dan al, o da yoksa URL'den türet
             raw_title = self.title_label.text().replace("📹  ", "").strip()
             
             if not raw_title:
-                # Fallback: URL'den video ID al
                 parsed = urllib.parse.urlparse(self.url_input.text())
                 vid_id = urllib.parse.parse_qs(parsed.query).get("v", ["thumbnail"])[0]
                 raw_title = vid_id
@@ -1466,17 +1485,13 @@ class VideoDownloader(QMainWindow):
                     self.reset_download_state()
                     return
 
-                # Seçilen satırdan Orijinal Format ID'sini ve "1080p, 4K" gibi metni alıyoruz
                 row = selected[0].row()
                 fmt_id = self.format_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
                 quality_txt = self.format_table.item(row, 0).text()
-
-                # yt-dlp'nin tahminde bulunmasını engelleyip DOĞRUDAN kullanıcının seçtiği Format ID'yi istiyoruz
                 fmt_str = f"{fmt_id}+bestaudio/bestvideo+bestaudio/best"
 
                 ydl_opts = {
                     "format": fmt_str,
-                    # outtmpl içinde quality_txt kullandık ki dosya adında 1080p, 4k gibi seçilen kalite yazsın
                     "outtmpl": os.path.join(download_path, f"%(title)s_{quality_txt}.%(ext)s"),
                     "merge_output_format": "mkv",
                     "keepvideo": False,
@@ -1520,9 +1535,43 @@ class VideoDownloader(QMainWindow):
             self.download_eta.setText("Remaining: --")
         
         if self.yt_time_range_cb.isChecked():
-            self.download_percent.setText("FFmpeg Cutting...")
+            self.download_percent.setText("🔀  FFmpeg Cutting...")
+            if not hasattr(self, "_monitor_timer"):
+                self._monitor_timer = QTimer()
+                self._monitor_timer.timeout.connect(self._monitor_cutting_progress)
+            self._monitor_timer.start(500)
         else:
-            self.download_percent.setText("Video+Audio Merging...")
+            self.download_percent.setText("🔀  Merging...")
+            if hasattr(self, "_monitor_timer"):
+                self._monitor_timer.stop()
+    
+    def _monitor_cutting_progress(self):
+        try:
+            if not hasattr(self, "active_download") or not self.active_download:
+                return
+            
+            download_path = self.get_download_path()
+            mkv_files = [f for f in os.listdir(download_path) 
+                        if f.endswith((".mkv", ".mp4")) 
+                        and os.path.isfile(os.path.join(download_path, f))
+                        and (datetime.now() - datetime.fromtimestamp(
+                            os.path.getmtime(os.path.join(download_path, f))
+                        )).total_seconds() < 60]
+            
+            if mkv_files:
+                latest = max(mkv_files, 
+                            key=lambda x: os.path.getmtime(os.path.join(download_path, x)))
+                fsize = os.path.getsize(os.path.join(download_path, latest))
+                if fsize > 0:
+                    if fsize > 1024**3:
+                        sz_text = f"{fsize/1024**3:.2f} GB"
+                    elif fsize > 1024**2:
+                        sz_text = f"{fsize/1024**2:.1f} MB"
+                    else:
+                        sz_text = f"{fsize/1024:.1f} KB"
+                    self.download_size.setText(f"Processing: {sz_text}")
+        except Exception:
+            pass
 
     def update_progress(self, d: dict):
         try:
@@ -1534,21 +1583,19 @@ class VideoDownloader(QMainWindow):
                 self._speed_samples.append(raw_speed)
             speed = sum(self._speed_samples) / len(self._speed_samples) if self._speed_samples else 0
 
-            # ── YENİ: veri gelince range'i sıfırla ──────────────────
             total      = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             downloaded = d.get("downloaded_bytes", 0) or 0
 
             if total:
                 pct = (downloaded / total) * 100
-                self.download_progress.setRange(0, 100)   # ← indeterminate'den çıkar
+                self.download_progress.setRange(0, 100)
                 self.download_progress.setValue(int(pct))
                 self.download_percent.setText(f"Progress: {pct:.1f}%")
             else:
-                # total bilinmiyor ama downloaded var — en azından onu göster
                 self.download_progress.setRange(0, 0)
                 if downloaded > 1024**2:
                     self.download_percent.setText(
-                        f"İndirilen: {downloaded/1024**2:.1f} MB"
+                        f"Downloaded: {downloaded/1024**2:.1f} MB"
                     )
             # ─────────────────────────────────────────────────────────
 
@@ -1566,9 +1613,9 @@ class VideoDownloader(QMainWindow):
                     sz = f"Size: {downloaded/1024**2:.1f} MB / {total/1024**2:.1f} MB"
             else:
                 if downloaded > 1024**3:
-                    sz = f"İndirilen: {downloaded/1024**3:.2f} GB"
+                    sz = f"Downloaded: {downloaded/1024**3:.2f} GB"
                 else:
-                    sz = f"İndirilen: {downloaded/1024**2:.1f} MB"
+                    sz = f"Downloaded: {downloaded/1024**2:.1f} MB"
             self.download_size.setText(sz)
 
             eta = d.get("eta")
@@ -1668,12 +1715,18 @@ class VideoDownloader(QMainWindow):
 
         def _show_folder():
             try:
+                target = filepath
+                if not os.path.exists(target):
+                    target = os.path.dirname(filepath)
                 if os.name == "nt":
-                    subprocess.run(f'explorer /select,"{filepath}"', shell=True)
+                    if os.path.isfile(target):
+                        subprocess.run(f'explorer /select,"{target}"', shell=True)
+                    else:
+                        subprocess.run(f'explorer "{target}"', shell=True)
                 elif os.name == "darwin":
-                    subprocess.run(["open", "-R", filepath])
+                    subprocess.run(["open", "-R", target])
                 else:
-                    subprocess.run(["xdg-open", os.path.dirname(filepath)])
+                    subprocess.run(["xdg-open", os.path.dirname(target) if os.path.isfile(target) else target])
             except Exception:
                 pass
 
@@ -1688,6 +1741,44 @@ class VideoDownloader(QMainWindow):
         dlg.exec()
 
     def convert_to_mp3(self, input_file: str) -> str | None:
+        """Convert downloaded audio to MP3 using libmp3lame (standard encoder)."""
+        output = os.path.splitext(input_file)[0] + ".mp3"
+        quality = getattr(self, "audio_quality_combo", None)
+        bitrate = quality.currentText() if quality else "192k"
+        if bitrate == "Best":
+            bitrate = "320k"
+            bitrate_tag = bitrate.replace("k", "")
+    
+        base = re.sub(r"\.[a-z0-9]+$", "", input_file, flags=re.IGNORECASE)
+        if not base.endswith(f"_{bitrate_tag}k"):
+            output = f"{base}_{bitrate_tag}k.mp3"
+        else:
+            output = f"{base}.mp3"
+            
+        cmd =["ffmpeg", "-i", input_file,
+               "-c:a", "libmp3lame",   
+               "-b:a", bitrate,
+               "-y", output]
+        try:
+            kwargs = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                
+            result = subprocess.run(cmd, capture_output=True, encoding='utf-8', errors='replace', **kwargs)
+            if result.returncode == 0:
+                if os.path.abspath(input_file) != os.path.abspath(output):
+                    try:
+                        os.remove(input_file)
+                    except Exception:
+                        pass
+                return output
+            else:
+                err = result.stderr[-500:] if result.stderr else "Unknown error"
+                QMessageBox.warning(self, "MP3 Conversion Error", err)
+                return None
+        except FileNotFoundError:
+            QMessageBox.warning(self, "Error", "FFmpeg not found. Please install it from the Settings tab.")
+            return None
         """Convert downloaded audio to MP3 using libmp3lame (standard encoder)."""
         output = os.path.splitext(input_file)[0] + ".mp3"
         quality = getattr(self, "audio_quality_combo", None)
@@ -1733,6 +1824,10 @@ class VideoDownloader(QMainWindow):
                 self.active_download.quit()
                 self.active_download.wait(2000)
                 self.active_download = None
+            
+            # Monitor timer'ı durdur
+            if hasattr(self, "_monitor_timer"):
+                self._monitor_timer.stop()
 
             self.download_button.setText("⬇ Download Video")
             self.mp3_download_button.setText("🎵 Download MP3")
@@ -1788,150 +1883,105 @@ class VideoDownloader(QMainWindow):
         QMessageBox.information(self, "Cancelled",
             "Download cancelled and temporary files removed.")
 
-    # ══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
     #  2. PLAYLIST TAB
     # ══════════════════════════════════════════════════════
 
     def setup_playlist_tab(self):
+        # Eğer eski widgetlar kaldıysa temizle
+        if self.playlist_tab.layout():
+            QWidget().setLayout(self.playlist_tab.layout())
+
         layout = QVBoxLayout(self.playlist_tab)
         layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
+        layout.setSpacing(15)
 
-        # Header
+        # 1. HEADER
         header = QWidget()
-        header.setStyleSheet("QWidget{background-color:#363636;border-radius:8px;padding:10px;}")
+        header.setStyleSheet("QWidget{background-color:#363636; border-radius:8px; padding:8px;}")
         hdr_lyt = QHBoxLayout(header)
-        hdr_lyt.setContentsMargins(10, 10, 10, 10)
-        hdr_lyt.setSpacing(12)
-        
+        hdr_lyt.setContentsMargins(10, 0, 10, 0)
+        hdr_lyt.setSpacing(10)
         ic = QLabel()
-        ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(
-            32, 32,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        ))
+        ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         hdr_lyt.addWidget(ic)
-
-        tc = QWidget()
-        tl = QVBoxLayout(tc)
-        tl.setContentsMargins(0, 0, 0, 0)
-        tl.setSpacing(2)
-        tl.addWidget(_make_label("Playlist Downloads", "color:#fff;font-size:16px;font-weight:bold;"))
-        tl.addWidget(_make_label("Download entire YouTube playlists", "color:#b0b0b0;font-size:12px;"))
-        hdr_lyt.addWidget(tc, 1)
-        
-        hdr_text = QLabel("")
-        hdr_text.setStyleSheet("font-size:16px;font-weight:bold;color:#ffffff;")
-        hdr_lyt.addWidget(hdr_text)
-        hdr_lyt.addStretch()
+        hdr_lyt.addWidget(_make_label("Playlist Downloads", "color:#fff; font-size:16px; font-weight:bold;"))
+        hdr_lyt.addWidget(_make_label("Download entire YouTube playlists.", "color:#b0b0b0; font-size:12px;"), 1)
         layout.addWidget(header)
 
-        # URL input container
-        url_container = QWidget()
-        url_container.setStyleSheet("QWidget{background-color:#2a2a2a;border-radius:6px;padding:12px;}")
-        url_lyt = QVBoxLayout(url_container)
-        url_lyt.setContentsMargins(0, 0, 0, 0)
-        url_lyt.setSpacing(8)
-        
-        input_row = QWidget()
-        input_row_lyt = QHBoxLayout(input_row)
-        input_row_lyt.setContentsMargins(0, 0, 0, 0)
-        input_row_lyt.setSpacing(8)
-        
+        # 2. SOURCE CARD
+        source_card = QWidget()
+        source_card.setObjectName("sourceCard")
+        source_card.setStyleSheet("QWidget#sourceCard {background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;}")
+        src_lyt = QVBoxLayout(source_card)
+        src_lyt.setContentsMargins(15, 15, 15, 15)
+        src_lyt.setSpacing(10)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(10)
         self.pl_url_input = QLineEdit()
         self.pl_url_input.setPlaceholderText("Paste a YouTube playlist or channel URL...")
-        self.pl_url_input.setMinimumHeight(36)
+        self.pl_url_input.setMinimumHeight(40)
         self.pl_url_input.setStyleSheet(_INPUT)
-        self.pl_url_input.returnPressed.connect(self.fetch_playlist_info)
-        
+        self.pl_url_input.returnPressed.connect(self.paste_playlist_url)
+
         self.pl_paste_btn = QPushButton("Paste")
-        self.pl_paste_btn.setMinimumHeight(36)
-        self.pl_paste_btn.setFixedWidth(80)
+        self.pl_paste_btn.setMinimumHeight(40)
+        self.pl_paste_btn.setFixedWidth(120)
         self.pl_paste_btn.setStyleSheet(_BTN_BLUE)
         self.pl_paste_btn.clicked.connect(self.paste_playlist_url)
+
+        input_row.addWidget(self.pl_url_input)
+        input_row.addWidget(self.pl_paste_btn)
+        src_lyt.addLayout(input_row)
+
+        self.pl_info_label = QLabel("Waiting for playlist URL...")
+        self.pl_info_label.setStyleSheet("color:#9e9e9e; font-size:13px; font-style:italic; padding-left:5px;")
+        src_lyt.addWidget(self.pl_info_label)
+
+        layout.addWidget(source_card)
+
+        # 3. CONTENT CARD
+        list_card = QWidget()
+        list_card.setObjectName("listCard")
+        list_card.setStyleSheet("QWidget#listCard {background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;}")
+        list_lyt = QVBoxLayout(list_card)
+        list_lyt.setContentsMargins(15, 15, 15, 15)
+        list_lyt.setSpacing(12)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(10)
         
-        self.pl_fetch_btn = QPushButton("Fetch")
-        self.pl_fetch_btn.setMinimumHeight(36)
-        self.pl_fetch_btn.setFixedWidth(80)
-        self.pl_fetch_btn.setStyleSheet(_BTN_BLUE)
-        self.pl_fetch_btn.clicked.connect(self.fetch_playlist_info)
-        
-        input_row_lyt.addWidget(self.pl_url_input)
-        input_row_lyt.addWidget(self.pl_paste_btn)
-        input_row_lyt.addWidget(self.pl_fetch_btn)
-        url_lyt.addWidget(input_row)
-        
-        self.pl_info_label = QLabel("No playlist loaded")
-        self.pl_info_label.setStyleSheet("color:#b0b0b0;font-size:12px;")
-        url_lyt.addWidget(self.pl_info_label)
-        layout.addWidget(url_container)
-
-        # Options row (compact inline) — Quality uses settings default
-        options_row = QWidget()
-        options_lyt = QHBoxLayout(options_row)
-        options_lyt.setContentsMargins(0, 0, 0, 0)
-        options_lyt.setSpacing(12)
-        
-        self.pl_audio_only_cb = QCheckBox("Audio Only (MP3)")
-        options_lyt.addWidget(self.pl_audio_only_cb)
-        options_lyt.addStretch()
-        layout.addWidget(options_row)
-
-        # Action buttons
-        action_row = QWidget()
-        action_lyt = QHBoxLayout(action_row)
-        action_lyt.setContentsMargins(0, 0, 0, 0)
-        action_lyt.setSpacing(10)
-
-        self.pl_start_btn = QPushButton("Start Download")
-        self.pl_start_btn.setMinimumHeight(36)
-        self.pl_start_btn.setStyleSheet(_BTN_BLUE)
-        self.pl_start_btn.setEnabled(False)
-        self.pl_start_btn.clicked.connect(self.start_playlist_download)
-
-        self.pl_cancel_btn = QPushButton("Cancel")
-        self.pl_cancel_btn.setMinimumHeight(36)
-        self.pl_cancel_btn.setStyleSheet(_BTN_RED)
-        self.pl_cancel_btn.setEnabled(False)
-        self.pl_cancel_btn.clicked.connect(self.cancel_playlist_download)
-
-        action_lyt.addWidget(self.pl_start_btn)
-        action_lyt.addWidget(self.pl_cancel_btn)
-        layout.addWidget(action_row)
-
-        # Selection controls
-        select_row = QWidget()
-        select_lyt = QHBoxLayout(select_row)
-        select_lyt.setContentsMargins(0, 0, 0, 0)
-        select_lyt.setSpacing(8)
+        btn_style = "QPushButton {background-color:#3a3a3a; color:#fff; border-radius:6px; padding:6px 12px; font-weight:bold;} QPushButton:hover{background-color:#4a4a4a;} QPushButton:disabled{color:#666;}"
         
         self.pl_select_all_btn = QPushButton("✓ Select All")
-        self.pl_select_all_btn.setMaximumWidth(120)
-        self.pl_select_all_btn.setMinimumHeight(32)
-        self.pl_select_all_btn.setStyleSheet(_BTN_BLUE)
+        self.pl_select_all_btn.setStyleSheet(btn_style)
         self.pl_select_all_btn.clicked.connect(self.select_all_playlist_videos)
         self.pl_select_all_btn.setEnabled(False)
-        
-        self.pl_deselect_all_btn = QPushButton("✗ Deselect All")
-        self.pl_deselect_all_btn.setMaximumWidth(120)
-        self.pl_deselect_all_btn.setMinimumHeight(32)
-        self.pl_deselect_all_btn.setStyleSheet(_BTN_RED)
+
+        self.pl_deselect_all_btn = QPushButton("✗ Deselect")
+        self.pl_deselect_all_btn.setStyleSheet(btn_style)
         self.pl_deselect_all_btn.clicked.connect(self.deselect_all_playlist_videos)
         self.pl_deselect_all_btn.setEnabled(False)
-        
-        self.pl_selected_count_lbl = QLabel("Selected: 0/0")
-        self.pl_selected_count_lbl.setStyleSheet("color:#b0b0b0;font-size:12px;")
-        
-        select_lyt.addWidget(self.pl_select_all_btn)
-        select_lyt.addWidget(self.pl_deselect_all_btn)
-        select_lyt.addStretch()
-        select_lyt.addWidget(self.pl_selected_count_lbl)
-        layout.addWidget(select_row)
 
-        # Playlist table
+        self.pl_audio_only_cb = QCheckBox("Audio Only (MP3)")
+        self.pl_audio_only_cb.setStyleSheet("color:#fff; font-size:13px; font-weight:bold;")
+
+        self.pl_selected_count_lbl = QLabel("Selected: 0/0")
+        self.pl_selected_count_lbl.setStyleSheet("color:#4caf50; font-weight:bold; font-size:13px;")
+
+        toolbar.addWidget(self.pl_select_all_btn)
+        toolbar.addWidget(self.pl_deselect_all_btn)
+        toolbar.addStretch()
+        toolbar.addWidget(self.pl_audio_only_cb)
+        toolbar.addSpacing(20)
+        toolbar.addWidget(self.pl_selected_count_lbl)
+        
+        list_lyt.addLayout(toolbar)
+
         self.pl_table = QTableWidget()
         self.pl_table.setColumnCount(4)
-        self.pl_table.setHorizontalHeaderLabels(["☑", "#", "Title", "Status"])
+        self.pl_table.setHorizontalHeaderLabels(["☑", "#", "Video Title", "Status"])
         hdr = self.pl_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -1939,61 +1989,110 @@ class VideoDownloader(QMainWindow):
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.pl_table.verticalHeader().setVisible(False)
         self.pl_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.pl_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.pl_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.pl_table.setShowGrid(False)
+        self.pl_table.setStyleSheet("""
+            QTableWidget { background-color: #242424; border: 1px solid #3d3d3d; border-radius: 6px; outline: none; }
+            QTableWidget::item { border-bottom: 1px solid #333333; padding: 4px; }
+            QTableWidget::item:selected { background-color: #1976d2; }
+            QHeaderView::section { background-color: #2d2d2d; color: #90caf9; padding: 6px; border: none; border-bottom: 2px solid #1976d2; font-size: 13px; font-weight: bold; }
+        """)
         self.pl_table.itemClicked.connect(self.on_playlist_item_clicked)
-        layout.addWidget(self.pl_table)
+        list_lyt.addWidget(self.pl_table)
 
-        # Progress section (at bottom)
-        prog_container = QWidget()
-        prog_container.setStyleSheet("QWidget{background-color:#2a2a2a;border-radius:6px;padding:12px;}")
-        pg_lyt = QVBoxLayout(prog_container)
-        pg_lyt.setContentsMargins(0, 0, 0, 0)
-        pg_lyt.setSpacing(8)
+        layout.addWidget(list_card, 1)
+
+        # 4. ACTION & PROGRESS CARD
+        prog_card = QWidget()
+        prog_card.setObjectName("progCard")
+        prog_card.setStyleSheet("QWidget#progCard {background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;}")
+        pg_lyt = QVBoxLayout(prog_card)
+        pg_lyt.setContentsMargins(15, 15, 15, 15)
+        pg_lyt.setSpacing(12)
+
+        action_row = QHBoxLayout()
+        self.pl_start_btn = QPushButton("▶  Start Download")
+        self.pl_start_btn.setMinimumHeight(42)
+        self.pl_start_btn.setStyleSheet(_BTN_BLUE + "font-size:14px;")
+        self.pl_start_btn.setEnabled(False)
+        self.pl_start_btn.clicked.connect(self.start_playlist_download)
+
+        self.pl_cancel_btn = QPushButton("⏹  Stop")
+        self.pl_cancel_btn.setMinimumHeight(42)
+        self.pl_cancel_btn.setFixedWidth(120)
+        self.pl_cancel_btn.setStyleSheet(_BTN_RED + "font-size:14px;")
+        self.pl_cancel_btn.setEnabled(False)
+        self.pl_cancel_btn.clicked.connect(self.cancel_playlist_download)
+
+        action_row.addWidget(self.pl_start_btn)
+        action_row.addWidget(self.pl_cancel_btn)
+        pg_lyt.addLayout(action_row)
 
         self.pl_current_label = QLabel("Idle")
-        self.pl_current_label.setStyleSheet("color:#b0b0b0;font-size:12px;")
+        self.pl_current_label.setStyleSheet("color:#e0e0e0; font-size:13px; font-weight:bold; margin-top:2px;")
         pg_lyt.addWidget(self.pl_current_label)
 
+        bars_lyt = QVBoxLayout()
+        bars_lyt.setSpacing(8)
+        
         self.pl_overall_bar = QProgressBar()
         self.pl_overall_bar.setMinimumHeight(18)
-        self.pl_overall_bar.setFormat("Overall: %p%")
-        pg_lyt.addWidget(self.pl_overall_bar)
+        self.pl_overall_bar.setFormat("Overall Progress: %p%")
+        self.pl_overall_bar.setStyleSheet("""
+            QProgressBar { border: none; background-color: #3a3a3a; border-radius: 9px; color: white; text-align: center; font-size: 11px; font-weight: bold;} 
+            QProgressBar::chunk { background-color: #4caf50; border-radius: 9px; }
+        """)
 
         self.pl_video_bar = QProgressBar()
-        self.pl_video_bar.setMinimumHeight(18)
-        self.pl_video_bar.setFormat("Current: %p%")
-        pg_lyt.addWidget(self.pl_video_bar)
+        self.pl_video_bar.setMinimumHeight(16)
+        self.pl_video_bar.setFormat("Current Video: %p%")
+        self.pl_video_bar.setStyleSheet("""
+            QProgressBar { border: none; background-color: #3a3a3a; border-radius: 8px; color: white; text-align: center; font-size: 10px;} 
+            QProgressBar::chunk { background-color: #2196f3; border-radius: 8px; }
+        """)
 
-        det_row = QWidget()
-        det_lyt = QHBoxLayout(det_row)
-        det_lyt.setContentsMargins(0, 0, 0, 0)
-        det_lyt.setSpacing(16)
-        
+        bars_lyt.addWidget(self.pl_overall_bar)
+        bars_lyt.addWidget(self.pl_video_bar)
+        pg_lyt.addLayout(bars_lyt)
+
+        det_row = QHBoxLayout()
         self.pl_speed_lbl = QLabel("Speed: --")
         self.pl_eta_lbl = QLabel("Remaining: --")
         self.pl_size_lbl = QLabel("Size: --")
         for lbl in (self.pl_speed_lbl, self.pl_eta_lbl, self.pl_size_lbl):
-            lbl.setStyleSheet("color:#b0b0b0;font-size:11px;")
-            det_lyt.addWidget(lbl)
-        det_lyt.addStretch()
-        pg_lyt.addWidget(det_row)
-        layout.addWidget(prog_container)
+            lbl.setStyleSheet("color:#b0b0b0; font-size:12px; font-weight:bold;")
+            det_row.addWidget(lbl)
+        det_row.addStretch()
+        pg_lyt.addLayout(det_row)
+
+        layout.addWidget(prog_card)
 
     def paste_playlist_url(self):
-        text = QApplication.clipboard().text().strip()
-        if text:
-            self.pl_url_input.setText(text)
+        try:
+            clipboard_text = QApplication.clipboard().text().strip()
+            if clipboard_text and "http" in clipboard_text:
+                self.pl_url_input.setText(clipboard_text)
+                
+            current_text = self.pl_url_input.text().strip()
+            if not current_text:
+                QMessageBox.warning(self, "Error", "Please enter a valid link in the box or paste it.")
+                return
+                
+            self.fetch_playlist_info()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred:\n{str(e)}")
 
     def fetch_playlist_info(self):
         url = self.pl_url_input.text().strip()
         if not url:
-            QMessageBox.warning(self, "Warning", "Please enter a playlist URL.")
             return
 
-        self.pl_fetch_btn.setEnabled(False)
-        self.pl_fetch_btn.setText("Fetching...")
+        self.pl_paste_btn.setEnabled(False)
+        self.pl_paste_btn.setText("Fetching...")
         self.pl_info_label.setText("Fetching playlist info...")
         self.pl_table.setRowCount(0)
-        self._playlist_entries = []
+        self._playlist_entries =[]
 
         self._playlist_info_thread = PlaylistInfoThread(url)
         self._playlist_info_thread.info_ready.connect(self.on_playlist_info_ready)
@@ -2001,60 +2100,44 @@ class VideoDownloader(QMainWindow):
         self._playlist_info_thread.start()
 
     def on_playlist_info_ready(self, info: dict):
-        self.pl_fetch_btn.setEnabled(True)
-        self.pl_fetch_btn.setText("🔍 Fetch Playlist")
+        self.pl_paste_btn.setEnabled(True)
+        self.pl_paste_btn.setText("Paste")
 
         entries = list(info.get("entries") or [])
-
-        # Handle nested playlists (playlist of playlists — flatten one level)
-        flat = []
+        flat =[]
         for e in entries:
             if e and e.get("_type") == "playlist" and e.get("entries"):
                 flat.extend(e["entries"])
             elif e:
                 flat.append(e)
-        entries = [e for e in flat if e]   # remove None / private videos
+        entries =[e for e in flat if e]
 
         if not entries:
-            # Might be a single video URL rather than a playlist
-            self.pl_info_label.setText(
-                "⚠️  No playlist entries found. "
-                "Make sure the URL contains a 'list=' parameter."
-            )
-            self.pl_fetch_btn.setEnabled(True)
-            self.pl_fetch_btn.setText("🔍 Fetch Playlist")
+            self.pl_info_label.setText("⚠️  No playlist entries found. Make sure the URL contains a 'list=' parameter.")
             return
 
         self._playlist_entries = entries
-
         pl_title = info.get("title") or info.get("playlist_title") or "Playlist"
-        self.pl_info_label.setText(
-            f"📋  <b>{pl_title}</b>  —  {len(entries)} video(s) found"
-        )
+        self.pl_info_label.setText(f"📋  <b>{pl_title}</b>  —  {len(entries)} video(s) found")
 
-        # Populate table
         self.pl_table.setRowCount(0)
         for i, entry in enumerate(entries):
             row = self.pl_table.rowCount()
             self.pl_table.insertRow(row)
             
-            # Checkbox column (column 0)
             checkbox_item = QTableWidgetItem()
             checkbox_item.setCheckState(Qt.CheckState.Checked)
             checkbox_item.setFlags(checkbox_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             checkbox_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.pl_table.setItem(row, 0, checkbox_item)
             
-            # Index column (column 1)
             num = QTableWidgetItem(str(i + 1))
             num.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.pl_table.setItem(row, 1, num)
             
-            # Title column (column 2)
             title = QTableWidgetItem(entry.get("title") or f"Video {i + 1}")
             self.pl_table.setItem(row, 2, title)
             
-            # Status column (column 3)
             status = QTableWidgetItem("Pending")
             status.setForeground(QColor("#b0b0b0"))
             status.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2066,45 +2149,37 @@ class VideoDownloader(QMainWindow):
         self.update_playlist_selection_count()
 
     def on_playlist_info_error(self, error: str):
-        self.pl_fetch_btn.setEnabled(True)
-        self.pl_fetch_btn.setText("🔍 Fetch Playlist")
+        self.pl_paste_btn.setEnabled(True)
+        self.pl_paste_btn.setText("Paste")
         self.pl_info_label.setText("Failed to fetch playlist.")
         QMessageBox.warning(self, "Error", f"Could not fetch playlist:\n{error}")
 
     def on_playlist_item_clicked(self, item):
-        """Handle checkbox clicks to update selection counter."""
-        if item.column() == 0:  # Checkbox column
+        if item.column() == 0:
             self.update_playlist_selection_count()
 
     def update_playlist_selection_count(self):
-        """Update the selected count label."""
         total = self.pl_table.rowCount()
-        selected = sum(1 for row in range(total)
-                      if self.pl_table.item(row, 0).checkState() == Qt.CheckState.Checked)
+        selected = sum(1 for row in range(total) if self.pl_table.item(row, 0).checkState() == Qt.CheckState.Checked)
         self.pl_selected_count_lbl.setText(f"Selected: {selected}/{total}")
 
     def select_all_playlist_videos(self):
-        """Check all videos in the playlist."""
         for row in range(self.pl_table.rowCount()):
-            item = self.pl_table.item(row, 0)
-            item.setCheckState(Qt.CheckState.Checked)
+            self.pl_table.item(row, 0).setCheckState(Qt.CheckState.Checked)
         self.update_playlist_selection_count()
 
     def deselect_all_playlist_videos(self):
-        """Uncheck all videos in the playlist."""
         for row in range(self.pl_table.rowCount()):
-            item = self.pl_table.item(row, 0)
-            item.setCheckState(Qt.CheckState.Unchecked)
+            self.pl_table.item(row, 0).setCheckState(Qt.CheckState.Unchecked)
         self.update_playlist_selection_count()
 
     def start_playlist_download(self):
-        if not self._playlist_entries:
+        if not getattr(self, '_playlist_entries', None):
             QMessageBox.warning(self, "Warning", "Please fetch a playlist first.")
             return
 
-        # Collect only selected entries with their original indices
         selected_entries = []
-        selected_indices = []
+        selected_indices =[]
         for row in range(self.pl_table.rowCount()):
             if self.pl_table.item(row, 0).checkState() == Qt.CheckState.Checked:
                 selected_entries.append(self._playlist_entries[row])
@@ -2114,67 +2189,38 @@ class VideoDownloader(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please select at least one video.")
             return
 
-        base_path  = self.get_download_path()
-        # Use default quality from settings
+        base_path = self.get_download_path()
         quality = self.video_quality_combo.currentText()
         audio_only = self.pl_audio_only_cb.isChecked()
 
-        # Create a dedicated subfolder named after the playlist
-        pl_title      = self.pl_info_label.text()
-        # Extract playlist name from label "📋  <b>NAME</b> — N video(s) found"
-        import html
-        raw = re.sub(r"<[^>]+>", "", pl_title).strip()          # strip HTML tags
+        pl_title = self.pl_info_label.text()
+        raw = re.sub(r"<[^>]+>", "", pl_title).strip()
         raw = re.sub(r"\s*—.*$", "", raw).replace("📋", "").strip()
-        safe_pl_name  = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw) or "Playlist"
+        safe_pl_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw) or "Playlist"
         download_path = os.path.join(base_path, safe_pl_name)
         os.makedirs(download_path, exist_ok=True)
 
-        speed_opts = {
-            "concurrent_fragment_downloads": 10,
-            "buffersize": 16384,
-        }
+        speed_opts = {"concurrent_fragment_downloads": 10, "buffersize": 16384}
 
         if audio_only:
             ydl_opts = {
                 "format": "bestaudio/best",
                 "outtmpl": os.path.join(download_path, "%(title)s.%(ext)s"),
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],'extractor_args': {
-                        'youtube': {
-                            'player_client': ['web', 'android'],
-                        }
-                    },
-                    'http_headers': {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    },
+                "postprocessors":[{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
                 "quiet": True, "no_warnings": True,
                 **speed_opts,
             }
         else:
             fmt = "bestvideo+bestaudio/best"
             if quality != "Best":
-                h   = quality.replace("p", "")
-                fmt = (
-                f"bestvideo[height<={h}]+bestaudio/"
-                f"bestvideo+bestaudio/"
-                f"best"
-            )
+                h = quality.replace("p", "")
+                fmt = f"bestvideo[height<={h}]+bestaudio/bestvideo+bestaudio/best"
             ydl_opts = {
                 "format": fmt,
                 "outtmpl": os.path.join(download_path, "%(title)s_%(height)sp.%(ext)s"),
                 "merge_output_format": "mkv",
                 "quiet": True, "no_warnings": True,
-                "encoding": "utf-8",                
-                "restrictfilenames": False,            
-                "windowsfilenames": True,  
-                "keepvideo": False,
-                "postprocessors": [
-                    {"key": "FFmpegVideoConvertor", "preferedformat": "mkv"},
-                    {"key": "FFmpegVideoRemuxer",   "preferedformat": "mkv"},
-                ],
+                "encoding": "utf-8", "restrictfilenames": False, "windowsfilenames": True, "keepvideo": False,
                 **speed_opts,
             }
 
@@ -2184,15 +2230,11 @@ class VideoDownloader(QMainWindow):
         self.pl_video_bar.setValue(0)
         self.pl_current_label.setText(f"📁  Saving to: {download_path}")
         self._pl_speed_samples.clear()
-        
-        # Store selected indices for progress tracking
         self._pl_selected_indices = selected_indices
 
         self.active_playlist_dl = PlaylistDownloadThread(
             PlaylistInfoThread._to_playlist_url(self.pl_url_input.text().strip()),
-            download_path,
-            ydl_opts,
-            selected_entries,  # Use only selected entries
+            download_path, ydl_opts, selected_entries
         )
         self.active_playlist_dl.progress_signal.connect(self.on_playlist_video_progress)
         self.active_playlist_dl.video_started_signal.connect(self.on_playlist_video_started)
@@ -2202,35 +2244,28 @@ class VideoDownloader(QMainWindow):
         self.active_playlist_dl.start()
 
     def on_playlist_video_started(self, index: int, title: str):
-        # index is 1-based from download thread (1 to len(selected_entries))
         total_selected = len(getattr(self, '_pl_selected_indices', self._playlist_entries))
-        self.pl_current_label.setText(
-            f"Downloading {index}/{total_selected}: {title}"
-        )
+        self.pl_current_label.setText(f"Downloading {index}/{total_selected}: {title}")
         self.pl_video_bar.setValue(0)
         
-        # Mark previous as done using original table row index
         if index > 1:
             prev_table_row = self._pl_selected_indices[index - 2]
-            status_item = self.pl_table.item(prev_table_row, 3)  # Column 3 = Status
+            status_item = self.pl_table.item(prev_table_row, 3)
             if status_item:
                 status_item.setText("✅ Done")
                 status_item.setForeground(QColor("#4caf50"))
         
-        # Mark current as downloading using original table row index
         curr_table_row = self._pl_selected_indices[index - 1]
-        status_item = self.pl_table.item(curr_table_row, 3)  # Column 3 = Status
+        status_item = self.pl_table.item(curr_table_row, 3)
         if status_item:
             status_item.setText("⬇ Downloading")
             status_item.setForeground(QColor("#2196f3"))
         
-        # Update overall progress
         overall_pct = ((index - 1) / total_selected) * 100
         self.pl_overall_bar.setValue(int(overall_pct))
 
-
     def on_playlist_video_progress(self, d: dict):
-        total      = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
         downloaded = d.get("downloaded_bytes", 0) or 0
         if total:
             pct = (downloaded / total) * 100
@@ -2252,47 +2287,36 @@ class VideoDownloader(QMainWindow):
             self.pl_eta_lbl.setText(f"Remaining: {h:02d}:{m:02d}:{s:02d}")
 
         if total:
-            sz = (f"{downloaded/1024**2:.1f} / {total/1024**2:.1f} MB"
-                  if total < 1024**3
-                  else f"{downloaded/1024**3:.2f} / {total/1024**3:.2f} GB")
+            sz = (f"{downloaded/1024**2:.1f} / {total/1024**2:.1f} MB" if total < 1024**3 else f"{downloaded/1024**3:.2f} / {total/1024**3:.2f} GB")
             self.pl_size_lbl.setText(f"Size: {sz}")
 
         total_count = len(getattr(self, '_pl_selected_indices', self._playlist_entries))
-        
         if total_count and self.active_playlist_dl:
             done = self.active_playlist_dl.current_index - 1
             overall = ((done + (downloaded / total if total else 0)) / total_count) * 100
             self.pl_overall_bar.setValue(int(overall))
 
     def on_playlist_video_done(self, index: int, filepath: str):
-        # index is 1-based from download thread
         table_row = self._pl_selected_indices[index - 1]
         status_item = self.pl_table.item(table_row, 3)
         if status_item:
             status_item.setText("✅ Done")
             status_item.setForeground(QColor("#4caf50"))
         if filepath:
-            self.add_to_history(
-                os.path.basename(filepath),
-                self.pl_url_input.text(),
-                "Finished",
-                filepath,
-            )
+            self.add_to_history(os.path.basename(filepath), self.pl_url_input.text(), "Finished", filepath)
 
     def on_playlist_error(self, msg: str, index: int):
         if index >= 0:
-            table_row = self._pl_selected_indices[index]  # index is 0-based here from thread
-            status_item = self.pl_table.item(table_row, 3)  # Column 3 = Status
+            table_row = self._pl_selected_indices[index]
+            status_item = self.pl_table.item(table_row, 3)
             if status_item:
                 status_item.setText("❌ Error")
                 status_item.setForeground(QColor("#f44336"))
-            print(f"Playlist video {index + 1} error: {msg}")
         else:
             QMessageBox.critical(self, "Playlist Error", msg)
             self.reset_playlist_state()
 
     def on_playlist_all_done(self):
-        # Mark last video done if not already marked
         if hasattr(self, '_pl_selected_indices') and self._pl_selected_indices:
             last_row = self._pl_selected_indices[-1]
             item = self.pl_table.item(last_row, 3)
@@ -2304,15 +2328,8 @@ class VideoDownloader(QMainWindow):
         self.pl_current_label.setText("✅  All downloads complete!")
         self.reset_playlist_state()
 
-        # Show completion with open-folder button
-        dl_dir = ""
-        if self.active_playlist_dl:
-            dl_dir = self.active_playlist_dl.download_path
-        elif self._playlist_entries:
-            dl_dir = self.get_download_path()
+        dl_dir = self.active_playlist_dl.download_path if self.active_playlist_dl else self.get_download_path()
         self._show_done_dialog(dl_dir, title="Playlist Download Complete")
-
-        
 
     def cancel_playlist_download(self):
         if self.active_playlist_dl:
@@ -2322,7 +2339,7 @@ class VideoDownloader(QMainWindow):
 
     def reset_playlist_state(self):
         self.active_playlist_dl = None
-        self.pl_start_btn.setEnabled(len(self._playlist_entries) > 0)
+        self.pl_start_btn.setEnabled(bool(getattr(self, '_playlist_entries', None)))
         self.pl_cancel_btn.setEnabled(False)
 
     # ══════════════════════════════════════════════════════
@@ -2330,232 +2347,198 @@ class VideoDownloader(QMainWindow):
     # ══════════════════════════════════════════════════════
 
     def setup_live_tab(self):
+        if self.live_tab.layout():
+            QWidget().setLayout(self.live_tab.layout())
+
         layout = QVBoxLayout(self.live_tab)
         layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
+        layout.setSpacing(15)
 
-        # Header
+        # 1. HEADER CARD
         header = QWidget()
-        header.setStyleSheet("QWidget{background-color:#363636;border-radius:8px;padding:10px;}")
+        header.setStyleSheet("QWidget{background-color:#363636; border-radius:8px; padding:8px;}")
         hdr_lyt = QHBoxLayout(header)
-        hdr_lyt.setContentsMargins(10, 10, 10, 10)
-        
+        hdr_lyt.setContentsMargins(10, 0, 10, 0)
+        hdr_lyt.setSpacing(10)
         ic = QLabel()
         ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         hdr_lyt.addWidget(ic)
-        
-        tc = QWidget()
-        tl = QVBoxLayout(tc)
-        tl.setContentsMargins(0, 0, 0, 0)
-        tl.setSpacing(2)
-        tl.addWidget(_make_label("Live Stream Recorder", "color:#fff;font-size:16px;font-weight:bold;"))
-        tl.addWidget(_make_label("Record YouTube live or DVR streams", "color:#b0b0b0;font-size:12px;"))
-        hdr_lyt.addWidget(tc, 1)
+        hdr_lyt.addWidget(_make_label("Live Stream Recorder", "color:#fff; font-size:16px; font-weight:bold;"))
+        hdr_lyt.addWidget(_make_label("Record YouTube live or DVR streams.", "color:#b0b0b0; font-size:12px;"), 1)
         layout.addWidget(header)
 
-        # URL Input
-        url_container = QWidget()
-        url_container.setStyleSheet("QWidget{background-color:#363636;border-radius:8px;padding:15px;}")
-        url_row = QHBoxLayout(url_container)
-        url_row.setContentsMargins(5, 5, 5, 5)
-        url_row.setSpacing(8)
+        # 2. SOURCE CARD
+        source_card = QWidget()
+        source_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        src_lyt = QVBoxLayout(source_card)
+        src_lyt.setContentsMargins(15, 15, 15, 15)
 
+        input_row = QHBoxLayout()
+        input_row.setSpacing(10)
+        
         self.live_url_input = QLineEdit()
         self.live_url_input.setPlaceholderText("Paste YouTube live stream URL...")
-        self.live_url_input.setMinimumHeight(38)
+        self.live_url_input.setMinimumHeight(40)
         self.live_url_input.setStyleSheet(_INPUT)
+        self.live_url_input.returnPressed.connect(self.paste_live_url)
 
         self.live_paste_btn = QPushButton("Paste")
-        self.live_paste_btn.setMinimumHeight(38)
-        self.live_paste_btn.setFixedWidth(100)
+        self.live_paste_btn.setMinimumHeight(40)
+        self.live_paste_btn.setFixedWidth(120)
         self.live_paste_btn.setStyleSheet(_BTN_BLUE)
         self.live_paste_btn.clicked.connect(self.paste_live_url)
 
-        url_row.addWidget(self.live_url_input)
-        url_row.addWidget(self.live_paste_btn)
-        layout.addWidget(url_container)
+        input_row.addWidget(self.live_url_input)
+        input_row.addWidget(self.live_paste_btn)
+        src_lyt.addLayout(input_row)
+        layout.addWidget(source_card)
 
-        # Stream Info (hidden until fetched) - YouTube tab style
+        # 3. STREAM INFO CARD
         self.live_info_group = QWidget()
-        self.live_info_group.setStyleSheet("QWidget{background-color:#2d2d2d;border-radius:8px;border:1px solid #3d3d3d;padding:12px;}")
+        self.live_info_group.setStyleSheet("QWidget#li_card {background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;}")
+        self.live_info_group.setObjectName("li_card")
         li_lyt = QVBoxLayout(self.live_info_group)
-        li_lyt.setContentsMargins(0, 0, 0, 0)
-        li_lyt.setSpacing(12)
+        li_lyt.setContentsMargins(10, 10, 10, 10)
+        li_lyt.setSpacing(15)
 
-        # Thumbnail + Info row (left/right)
-        info_row = QWidget()
-        info_row_lyt = QHBoxLayout(info_row)
-        info_row_lyt.setContentsMargins(0, 0, 0, 0)
-        info_row_lyt.setSpacing(15)
+        info_row = QHBoxLayout()
+        info_row.setSpacing(10)
 
         # Left: Thumbnail
-        left_panel = QWidget()
-        left_panel.setFixedWidth(280)
-        left_lyt = QVBoxLayout(left_panel)
-        left_lyt.setContentsMargins(0, 0, 0, 0)
-        left_lyt.setSpacing(8)
-
+        left_panel = QVBoxLayout()
+        left_panel.setSpacing(8)
         self.live_thumbnail = QLabel()
         self.live_thumbnail.setFixedSize(280, 157)
-        self.live_thumbnail.setStyleSheet("border:1px solid #3a3a3a;border-radius:4px;background-color:#1a1a1a;")
+        self.live_thumbnail.setStyleSheet("border:1px solid #3d3d3d; border-radius:6px; background-color:#1e1e1e;")
         self.live_thumbnail.setScaledContents(True)
-        self.live_thumbnail.setText("Loading...")
         self.live_thumbnail.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        left_lyt.addWidget(self.live_thumbnail)
+        self.live_thumbnail.setText("Loading...")
+        left_panel.addWidget(self.live_thumbnail)
 
-        download_thumb_btn = QPushButton("Download Thumbnail")
-        download_thumb_btn.setFixedWidth(280)
-        download_thumb_btn.setStyleSheet(_BTN_BLUE)
-        download_thumb_btn.clicked.connect(self.download_live_thumbnail)
-        left_lyt.addWidget(download_thumb_btn)
-        info_row_lyt.addWidget(left_panel)
+        self.live_download_thumb_btn = QPushButton("⬇ Download Thumbnail")
+        self.live_download_thumb_btn.setFixedWidth(280)
+        self.live_download_thumb_btn.setStyleSheet(_BTN_BLUE)
+        self.live_download_thumb_btn.clicked.connect(self.download_live_thumbnail)
+        left_panel.addWidget(self.live_download_thumb_btn)
+        info_row.addLayout(left_panel)
 
         # Right: Stream Info
-        right_panel = QWidget()
-        right_lyt = QVBoxLayout(right_panel)
-        right_lyt.setContentsMargins(0, 0, 0, 0)
-        right_lyt.setSpacing(10)
+        right_panel = QVBoxLayout()
+        right_panel.setSpacing(8)
 
         self.live_info_title = QLabel("")
         self.live_info_title.setWordWrap(True)
-        self.live_info_title.setStyleSheet("color:#fff;font-size:14px;font-weight:bold;padding:6px 8px;background-color:#2d2d2d;border-radius:4px;border:1px solid #3d3d3d;")
-        right_lyt.addWidget(self.live_info_title)
+        self.live_info_title.setStyleSheet("color:#fff; font-size:14px; font-weight:bold; padding:8px 12px; background-color:#363636; border-radius:6px; border:1px solid #404040;")
+        right_panel.addWidget(self.live_info_title)
 
         self.live_info_channel = QLabel("")
-        self.live_info_channel.setStyleSheet("color:#8721fc;font-size:12px;font-weight:bold;padding:4px 8px;")
-        right_lyt.addWidget(self.live_info_channel)
+        self.live_info_channel.setStyleSheet("color:#8721fc; font-size:13px; font-weight:bold; padding:8px 12px; background-color:#363636; border-radius:6px; border:1px solid #404040;")
+        right_panel.addWidget(self.live_info_channel)
 
-        stats_row = QWidget()
-        stats_lyt = QHBoxLayout(stats_row)
-        stats_lyt.setContentsMargins(0, 0, 0, 0)
-        stats_lyt.setSpacing(8)
-
+        stats_row = QHBoxLayout()
+        stats_row.setSpacing(15)
         self.live_info_status = QLabel("")
-        self.live_info_status.setStyleSheet("color:#e0e0e0;font-size:12px;padding:4px 8px;background-color:#363636;border-radius:4px;border:1px solid #404040;")
-        stats_lyt.addWidget(self.live_info_status)
+        self.live_info_status.setStyleSheet("color:#e0e0e0; font-size:12px; padding:8px 12px; background-color:#363636; border-radius:6px; border:1px solid #404040;")
+        stats_row.addWidget(self.live_info_status)
 
         self.live_info_viewers = QLabel("")
-        self.live_info_viewers.setStyleSheet("color:#e0e0e0;font-size:12px;padding:4px 8px;background-color:#363636;border-radius:4px;border:1px solid #404040;")
-        stats_lyt.addWidget(self.live_info_viewers)
-        right_lyt.addWidget(stats_row)
+        self.live_info_viewers.setStyleSheet("color:#e0e0e0; font-size:12px; padding:8px 12px; background-color:#363636; border-radius:6px; border:1px solid #404040;")
+        stats_row.addWidget(self.live_info_viewers)
+        right_panel.addLayout(stats_row)
 
-        right_lyt.addStretch()
-        info_row_lyt.addWidget(right_panel)
-        li_lyt.addWidget(info_row)
+        self.live_info_time = QLabel("")
+        self.live_info_time.setStyleSheet("color:#e0e0e0; font-size:12px; padding:8px 12px; background-color:#363636; border-radius:6px; border:1px solid #404040;")
+        right_panel.addWidget(self.live_info_time)
 
-        # Fetch button
-        fetch_row = QWidget()
-        fetch_lyt = QHBoxLayout(fetch_row)
-        fetch_lyt.setContentsMargins(0, 0, 0, 0)
-        self.live_fetch_btn = QPushButton("Fetch Stream Info")
-        self.live_fetch_btn.setMinimumHeight(32)
-        self.live_fetch_btn.setMaximumWidth(180)
-        self.live_fetch_btn.setStyleSheet(_BTN_BLUE)
-        self.live_fetch_btn.clicked.connect(lambda: self._fetch_live_info(self.live_url_input.text().strip()))
-        fetch_lyt.addWidget(self.live_fetch_btn)
-        fetch_lyt.addStretch()
-        li_lyt.addWidget(fetch_row)
+        right_panel.addStretch()
+        info_row.addLayout(right_panel)
+        li_lyt.addLayout(info_row)
 
         layout.addWidget(self.live_info_group)
         self.live_info_group.hide()
 
-        # Output Format (minimal)
-        opt_container = QWidget()
-        opt_container.setStyleSheet("QWidget{background-color:#2d2d2d;border-radius:8px;padding:10px;border:1px solid #3d3d3d;}")
-        opt_lyt = QHBoxLayout(opt_container)
-        opt_lyt.setContentsMargins(8, 5, 8, 5)
-        opt_lyt.setSpacing(8)
+        # 4. ACTION & STATUS CARD
+        status_card = QWidget()
+        status_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        st_lyt = QVBoxLayout(status_card)
+        st_lyt.setContentsMargins(15, 15, 15, 15)
+        st_lyt.setSpacing(10)
 
-        opt_lyt.addWidget(QLabel("Output Format:"))
-        self.live_format_combo = QComboBox()
-        self.live_format_combo.addItems(["mkv", "mp4", "ts"])
-        self.live_format_combo.setStyleSheet(_COMBO)
-        self.live_format_combo.setMaximumWidth(100)
-        opt_lyt.addWidget(self.live_format_combo)
-        opt_lyt.addStretch()
-        layout.addWidget(opt_container)
-
-        # Timer interval options (for DVR streams)
-        opt_lyt.addWidget(QLabel("Start:"))
-        self.live_start_time = QLineEdit()
-        self.live_start_time.hide()
-        self.live_start_time.setPlaceholderText("00:00:00")
-        self.live_start_time.setFixedWidth(80)
-        self.live_start_time.setStyleSheet(_INPUT)
-        opt_lyt.addWidget(self.live_start_time)
-
-        opt_lyt.addWidget(QLabel("End:"))
-        self.live_end_time = QLineEdit()
-        self.live_end_time.hide()
-        self.live_end_time.setPlaceholderText("00:00:00")
-        self.live_end_time.setFixedWidth(80)
-        self.live_end_time.setStyleSheet(_INPUT)
-        opt_lyt.addWidget(self.live_end_time)
-
-        # Action Buttons
-        action_row = QWidget()
-        act_lyt = QHBoxLayout(action_row)
-        act_lyt.setContentsMargins(0, 0, 0, 0)
-        act_lyt.setSpacing(10)
-
-        self.live_start_btn = QPushButton("Start Recording")
-        self.live_start_btn.setMinimumHeight(36)
-        self.live_start_btn.setStyleSheet(_BTN_BLUE)
+        action_row = QHBoxLayout()
+        self.live_start_btn = QPushButton("▶  Start Recording")
+        self.live_start_btn.setMinimumHeight(42)
+        self.live_start_btn.setStyleSheet(_BTN_BLUE + "font-size:14px;")
         self.live_start_btn.clicked.connect(self.start_live_download)
 
-        self.live_stop_btn = QPushButton("Stop Recording")
-        self.live_stop_btn.setMinimumHeight(36)
-        self.live_stop_btn.setStyleSheet(_BTN_RED)
+        self.live_stop_btn = QPushButton("⏹  Stop Recording")
+        self.live_stop_btn.setMinimumHeight(42)
+        self.live_stop_btn.setFixedWidth(140)
+        self.live_stop_btn.setStyleSheet(_BTN_RED + "font-size:14px;")
         self.live_stop_btn.setEnabled(False)
         self.live_stop_btn.clicked.connect(self.stop_live_download)
 
-        act_lyt.addWidget(self.live_start_btn)
-        act_lyt.addWidget(self.live_stop_btn)
-        layout.addWidget(action_row)
-
-        # Recording Status
-        status_container = QWidget()
-        status_container.setStyleSheet("QWidget{background-color:#2d2d2d;border-radius:8px;border:1px solid #3d3d3d;padding:12px;}")
-        st_lyt = QVBoxLayout(status_container)
-        st_lyt.setContentsMargins(8, 8, 8, 8)
-        st_lyt.setSpacing(4)
+        action_row.addWidget(self.live_start_btn)
+        action_row.addWidget(self.live_stop_btn)
+        st_lyt.addLayout(action_row)
 
         self.live_status_lbl = QLabel("Idle")
-        self.live_status_lbl.setStyleSheet("font-size:13px;font-weight:bold;color:#b0b0b0;")
+        self.live_status_lbl.setStyleSheet("font-size:13px; font-weight:bold; color:#e0e0e0;")
         st_lyt.addWidget(self.live_status_lbl)
 
         self.live_folder_lbl = QLabel("")
-        self.live_folder_lbl.setStyleSheet("font-size:11px;color:#7986cb;padding:2px;")
+        self.live_folder_lbl.setStyleSheet("font-size:12px; color:#7986cb;")
         self.live_folder_lbl.setWordWrap(True)
         st_lyt.addWidget(self.live_folder_lbl)
 
         self.live_progress_bar = QProgressBar()
         self.live_progress_bar.setRange(0, 0)
-        self.live_progress_bar.setMinimumHeight(14)
+        self.live_progress_bar.setMinimumHeight(18)
+        self.live_progress_bar.setStyleSheet("""
+            QProgressBar { border: none; background-color: #3a3a3a; border-radius: 9px; color: white; text-align: center; font-size: 11px; font-weight: bold;} 
+            QProgressBar::chunk { background-color: #4caf50; border-radius: 9px; }
+        """)
         self.live_progress_bar.setVisible(False)
         st_lyt.addWidget(self.live_progress_bar)
 
-        det_row = QWidget()
-        det_lyt = QHBoxLayout(det_row)
-        det_lyt.setContentsMargins(0, 0, 0, 0)
-        det_lyt.setSpacing(15)
-
-        self.live_size_lbl = QLabel("Downloaded: --")
+        det_row = QHBoxLayout()
+        self.live_size_lbl = QLabel("Size: --")
         self.live_speed_lbl = QLabel("Speed: --")
         self.live_frags_lbl = QLabel("Frags: --")
         self.live_time_lbl = QLabel("Recorded: --:--")
         for lbl in (self.live_size_lbl, self.live_speed_lbl, self.live_frags_lbl, self.live_time_lbl):
-            lbl.setStyleSheet("color:#b0b0b0;font-size:11px;")
-            det_lyt.addWidget(lbl)
-        st_lyt.addWidget(det_row)
+            lbl.setStyleSheet("color:#b0b0b0; font-size:12px; font-weight:bold;")
+            det_row.addWidget(lbl)
+        det_row.addStretch()
+        st_lyt.addLayout(det_row)
 
-        layout.addWidget(status_container)
+        layout.addWidget(status_card)
         layout.addStretch()
 
+    def _on_live_enter_pressed(self):
+        """Kullanıcı kutuya manuel link girip Enter'a basarsa tetiklenir."""
+        url = self.live_url_input.text().strip()
+        if url:
+            self._fetch_live_info(url)
+
+
     def paste_live_url(self):
-        text = QApplication.clipboard().text().strip()
-        if text:
-            self.live_url_input.setText(text)
+        try:
+            clipboard_text = QApplication.clipboard().text().strip()
+            
+            # Eğer kutu boşsa veya içindeki link değiştiyse panodan al
+            if not self.live_url_input.text().strip() and clipboard_text and "http" in clipboard_text:
+                self.live_url_input.setText(clipboard_text)
+                
+            current_text = self.live_url_input.text().strip()
+            
+            if not current_text:
+                QMessageBox.warning(self, "Warning", "Please enter a live stream URL or paste one.")
+                return
+                
+            self._fetch_live_info(current_text)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"An unexpected error occurred:\n{e}")
 
     def _fetch_live_info(self, url: str, info: dict = None):
         """Fetch and display stream metadata in the Live tab."""
@@ -2563,8 +2546,8 @@ class VideoDownloader(QMainWindow):
             return
 
         def _apply(info: dict):
-            self.live_fetch_btn.setText("Fetch Stream Info")
-            self.live_fetch_btn.setEnabled(True)
+            self.live_paste_btn.setText("Paste")
+            self.live_paste_btn.setEnabled(True)
             if not info:
                 return
 
@@ -2573,6 +2556,7 @@ class VideoDownloader(QMainWindow):
             viewers = info.get("concurrent_view_count") or info.get("view_count") or 0
             status  = info.get("live_status") or ("Live" if info.get("is_live") else "—")
             thumbnail = info.get("thumbnail") or ""
+            publish_date = info.get("release_date") or info.get("upload_date") or ""
 
             self.live_info_title.setText(title)
             self.live_info_channel.setText(f"👤 {channel}")
@@ -2582,29 +2566,16 @@ class VideoDownloader(QMainWindow):
                 self.live_info_viewers.setText(f"👁 {v} viewers")
             else:
                 self.live_info_viewers.setText("—")
-
-                # ── Zaman aralığını duration'dan otomatik doldur ──────
-            dur = info.get("duration")
-            is_live = info.get("is_live") or info.get("live_status") == "is_live"
-            if dur and not is_live:
-                # DVR/bitmş yayın — baştan sona otomatik doldur
-                h, r = divmod(int(dur), 3600)
-                m, s = divmod(r, 60)
-                self.live_start_time.setText("00:00:00")
-                self.live_end_time.setText(f"{h:02d}:{m:02d}:{s:02d}")
-                self.live_start_time.setEnabled(True)
-                self.live_end_time.setEnabled(True)
+            
+            if publish_date:
+                try:
+                    pub_dt = datetime.strptime(publish_date, "%Y%m%d")
+                    self.live_info_time.setText(f"📅 {pub_dt.strftime('%d %B %Y')}")
+                except:
+                    self.live_info_time.setText(f"📅 {publish_date}")
             else:
-                # Gerçek canlı yayın — alanları temizle ve devre dışı bırak
-                self.live_start_time.clear()
-                self.live_end_time.clear()
-                self.live_start_time.setEnabled(False)
-                self.live_end_time.setEnabled(False)
-                self.live_start_time.hide()
-                self.live_end_time.hide()
-            # ──────────────────────────────────────────────────────
+                self.live_info_time.setText("—")
 
-            # Download and display thumbnail
             if thumbnail:
                 try:
                     thumb_thread = ThumbnailThread(thumbnail)
@@ -2620,14 +2591,17 @@ class VideoDownloader(QMainWindow):
             _apply(info)
             return
 
-        self.live_fetch_btn.setText("Fetching...")
-        self.live_fetch_btn.setEnabled(False)
+        # Start Fetching UI Update
+        self.live_paste_btn.setText("Fetching...")
+        self.live_paste_btn.setEnabled(False)
+        self.live_info_group.hide()
 
         thread = InfoFetchThread(url)
         thread.info_ready.connect(_apply)
         thread.error.connect(lambda e: (
-            self.live_fetch_btn.setText("Fetch Stream Info"),
-            self.live_fetch_btn.setEnabled(True),
+            self.live_paste_btn.setText("Paste"),
+            self.live_paste_btn.setEnabled(True),
+            QMessageBox.warning(self, "Error", f"Could not fetch stream info:\n{e}")
         ))
         self._live_info_thread = thread
         thread.start()
@@ -2672,16 +2646,15 @@ class VideoDownloader(QMainWindow):
             return
 
         base_path = self.get_download_path()
-        output_fmt = self.live_format_combo.currentText()
+        output_fmt = "mkv" # Artık her zaman mkv formatında birleştirilecek
 
         live_dir = os.path.join(base_path, "LiveStreams")
         os.makedirs(live_dir, exist_ok=True)
 
-        # Use best format for reliable live stream recording
         fmt = "bestvideo+bestaudio/best"
 
-        safe_outtmpl = os.path.join(live_dir, "%(id)s.%(ext)s")
-        ydl_args = [
+        safe_outtmpl = os.path.join(live_dir, "%(id)s.f%(format_id)s.%(ext)s")
+        ydl_args =[
             "--format",               fmt,
             "--output",               safe_outtmpl,
             "--merge-output-format",  output_fmt,
@@ -2693,25 +2666,19 @@ class VideoDownloader(QMainWindow):
             "--print", "after_move:%(title)s\t%(id)s\t%(filepath)s",
         ]
 
-        # ── Controls ──────────────────────
-        start_t = self.live_start_time.text().strip()
-        end_t   = self.live_end_time.text().strip()
-        if start_t and end_t:
-            ydl_args += ["--download-sections", f"*{start_t}-{end_t}"]
-        elif start_t:
-            ydl_args += ["--download-sections", f"*{start_t}-inf"]
-        # ─────────────────────────────────────────────────────
-
         self.live_start_btn.setEnabled(False)
         self.live_stop_btn.setEnabled(True)
         self.live_status_lbl.setText("Recording fragments...")
-        self.live_status_lbl.setStyleSheet("font-size:15px; font-weight:bold; color:#f44336;")
+        self.live_status_lbl.setStyleSheet("font-size:15px; font-weight:bold; color:#4caf50;")
         self.live_progress_bar.setVisible(True)
         self.live_folder_lbl.setText(f"Saving to: {live_dir}")
         self._live_dir = live_dir
         self._live_record_start = datetime.now()
         self._live_speed_samples.clear()
         self._live_streams = {}
+        # Yayın ismini kaydet (dosya adında kullanmak için)
+        self._live_stream_title = self.live_info_title.text() or "Stream"
+        self._live_stopped_by_user = False
 
         self.active_live_dl = LiveStreamThread(url, ydl_args, live_dir, output_fmt)
         self.active_live_dl.progress_signal.connect(self.update_live_progress)
@@ -2724,11 +2691,10 @@ class VideoDownloader(QMainWindow):
         """Called when yt-dlp finishes fragment downloading and starts merging."""
         if status == "merging":
             self.live_status_lbl.setText("🔀  Merging fragments with FFmpeg...")
-            self.live_status_lbl.setStyleSheet(
-                "font-size:15px; font-weight:bold; color:#ffb300;"
-            )
-            self.live_frags_lbl.setText("Fragments: all downloaded — merging...")
-            self.live_progress_bar.setRange(0, 0)   # indeterminate while merging
+            self.live_status_lbl.setStyleSheet("font-size:15px; font-weight:bold; color:#ffb300;")
+            
+            self.live_frags_lbl.setText("Fragments: Merging...")
+            self.live_progress_bar.setRange(0, 0)
 
     def update_live_progress(self, d: dict):
         """Works with both DownloadThread (yt-dlp API) and LiveStreamThread (subprocess) dicts."""
@@ -2753,9 +2719,9 @@ class VideoDownloader(QMainWindow):
         total_speed = sum(s["speed"]      for s in self._live_streams.values())
 
         if total_dl > 1024 ** 3:
-            self.live_size_lbl.setText(f"Downloaded: {total_dl/1024**3:.2f} GB")
+            self.live_size_lbl.setText(f"Size: {total_dl/1024**3:.2f} GB")
         else:
-            self.live_size_lbl.setText(f"Downloaded: {total_dl/1024**2:.1f} MB")
+            self.live_size_lbl.setText(f"Size: {total_dl/1024**2:.1f} MB")
 
         if total_speed > 0:
             self._live_speed_samples.append(total_speed)
@@ -2769,30 +2735,57 @@ class VideoDownloader(QMainWindow):
             self.live_speed_lbl.setText("Speed: --")
 
         if len(self._live_streams) > 1:
-            parts = []
+            parts =[]
             for i, (sid, s) in enumerate(sorted(self._live_streams.items()), 1):
                 lbl = "V" if i == 1 else "A"
                 fc  = s["frag_count"]
                 fi  = s["frag_idx"]
                 parts.append(f"{lbl}: {fi}/{fc}" if fc else f"{lbl}: {fi}")
-            self.live_frags_lbl.setText("Frags  " + "   ".join(parts))
+            self.live_frags_lbl.setText("Frags: " + " | ".join(parts))
         else:
             s  = list(self._live_streams.values())[0]
             fi, fc = s["frag_idx"], s["frag_count"]
-            self.live_frags_lbl.setText(f"Fragments: {fi}/{fc}" if fc else f"Fragments: {fi}")
+            self.live_frags_lbl.setText(f"Frags: {fi}/{fc}" if fc else f"Frags: {fi}")
 
-        # ── Recorded content duration estimation ─────────────────────────
-        # YouTube live HLS segments are typically ~2 seconds each.
-        # So: content_recorded ≈ video_frag_idx * YT_SEG_SECS
-        # Wall-clock elapsed is useless in DVR mode (downloading fast from history).
         try:
-            YT_SEG_SECS = 2.0   # YouTube's standard HLS segment duration
-            video_stream = self._live_streams.get(1) or list(self._live_streams.values())[0]
-            fi = video_stream["frag_idx"]
-            fc = video_stream["frag_count"]
+            video_stream = self._live_streams.get(1) 
+            if not video_stream and self._live_streams:
+                video_stream = list(self._live_streams.values())[0]
 
-            if fi and fi > 0:
-                done_secs = fi * YT_SEG_SECS
+            if video_stream:
+                fi = video_stream["frag_idx"]
+                fc = video_stream["frag_count"]
+
+                def _fmt(secs):
+                    h, r = divmod(int(secs), 3600)
+                    m, s = divmod(r, 60)
+                    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+                if fc == 100:  # standart % modu (bitmiş yayın)
+                    pct      = d.get("pct", fi)
+                    eta_secs = d.get("eta_secs", 0)
+                    if eta_secs > 0 and pct > 0 and pct < 100:
+                        total_secs = eta_secs / (1.0 - pct / 100.0)
+                        done_secs  = total_secs * (pct / 100.0)
+                        self.live_time_lbl.setText(f"Time: ~{_fmt(done_secs)} / {_fmt(total_secs)}")
+                    elif pct > 0:
+                        self.live_time_lbl.setText(f"Time: {pct:.1f}%")
+                elif fi and fi > 0:  # fragment modu (canlı yayın)
+                    YT_SEG_SECS = 2.0
+                    done_secs = fi * YT_SEG_SECS
+                    if fc and fc > 0:
+                        total_secs = fc * YT_SEG_SECS
+                        self.live_time_lbl.setText(f"Time: ~{_fmt(done_secs)} / {_fmt(total_secs)}")
+                    else:
+                        self.live_time_lbl.setText(f"Time: ~{_fmt(done_secs)}")
+                else:
+                    if self._live_record_start:
+                        elapsed = (datetime.now() - self._live_record_start).total_seconds()
+                        h, r = divmod(int(elapsed), 3600)
+                        m, s = divmod(r, 60)
+                        self.live_time_lbl.setText(
+                            f"Time: {h}:{m:02d}:{s:02d}" if h else f"Time: {m:02d}:{s:02d}"
+                        )
 
                 def _fmt(secs):
                     h, r = divmod(int(secs), 3600)
@@ -2800,35 +2793,36 @@ class VideoDownloader(QMainWindow):
                     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
                 if fc and fc > 0:
-                    # DVR: show "downloaded_so_far / total_content"
                     total_secs = fc * YT_SEG_SECS
-                    self.live_time_lbl.setText(f"~{_fmt(done_secs)} / {_fmt(total_secs)}")
+                    self.live_time_lbl.setText(f"Time: ~{_fmt(done_secs)} / {_fmt(total_secs)}")
                 else:
-                    # Live edge: just show approximate recorded duration
-                    self.live_time_lbl.setText(f"~{_fmt(done_secs)} recorded")
+                    self.live_time_lbl.setText(f"Time: ~{_fmt(done_secs)}")
             else:
-                # No frag info yet — fall back to wall-clock elapsed
                 if self._live_record_start:
                     elapsed = (datetime.now() - self._live_record_start).total_seconds()
                     h, r = divmod(int(elapsed), 3600)
                     m, s = divmod(r, 60)
                     self.live_time_lbl.setText(
-                        f"Elapsed: {h}:{m:02d}:{s:02d}" if h else f"Elapsed: {m:02d}:{s:02d}"
+                        f"Time: {h}:{m:02d}:{s:02d}" if h else f"Time: {m:02d}:{s:02d}"
                     )
         except Exception:
             pass
 
-        best = max(self._live_streams.values(), key=lambda s: s["frag_count"] or 0)
-        fi, fc = best["frag_idx"], best["frag_count"]
-        if fc:
-            try:
-                pct = int(fi / fc * 100)
-                self.live_progress_bar.setRange(0, 100)
-                self.live_progress_bar.setValue(pct)
-            except (ZeroDivisionError, TypeError):
+        video_stream = self._live_streams.get(1) 
+        if not video_stream and self._live_streams:
+            video_stream = list(self._live_streams.values())[0]
+
+        if video_stream:
+            fi, fc = video_stream["frag_idx"], video_stream["frag_count"]
+            if fc:
+                try:
+                    pct = int((fi / fc) * 100)
+                    self.live_progress_bar.setRange(0, 100)
+                    self.live_progress_bar.setValue(pct)
+                except (ZeroDivisionError, TypeError):
+                    self.live_progress_bar.setRange(0, 0)
+            else:
                 self.live_progress_bar.setRange(0, 0)
-        else:
-            self.live_progress_bar.setRange(0, 0)
 
     def on_live_error(self, error: str):
         self.live_status_lbl.setText("❌  Error")
@@ -2850,7 +2844,9 @@ class VideoDownloader(QMainWindow):
                 "Finished",
                 filepath,
             )
-            self._show_done_dialog(filepath, title="Recording Complete")
+            # Eğer user tarafından stop edilmediyse modal göster
+            if not getattr(self, "_live_stopped_by_user", False):
+                self._show_done_dialog(filepath, title="Recording Complete")
         self.reset_live_state()
 
     def stop_live_download(self):
@@ -2860,6 +2856,8 @@ class VideoDownloader(QMainWindow):
         self.live_stop_btn.setEnabled(False)
         self.live_status_lbl.setText("⏳  Stopping...")
         self.live_status_lbl.setStyleSheet("font-size:15px; font-weight:bold; color:#ffb300;")
+        # Stop flag'i set et (çift modal sorunu çözmek için)
+        self._live_stopped_by_user = True
 
         thread   = self.active_live_dl
         live_dir = getattr(self, "_live_dir", "")
@@ -2882,146 +2880,80 @@ class VideoDownloader(QMainWindow):
         thread.cancel()
 
     def _merge_live_fragments(self, live_dir: str) -> str:
-        """
-        Handle two cases after stop:
-
-        Case A — yt-dlp downloaded complete stream files (no .part suffix):
-          ePzWqox8T-A.f299.mkv  (video)
-          ePzWqox8T-A.f140.mkv  (audio)
-          → FFmpeg -i video -i audio -c copy output.mkv
-
-        Case B — yt-dlp left fragment files mid-download:
-          Title.f299.mkv.part-Frag0 .. part-Frag500
-          → concat all fragments per stream, then mux
-        
-        Returns the final output filepath, or empty string on error.
-        """
         if not os.path.isdir(live_dir):
-            self.live_status_lbl.setText("\u29b9  Stopped. No folder found.")
-            return
+            return ""
 
-        all_files = [f for f in os.listdir(live_dir)
-                     if os.path.isfile(os.path.join(live_dir, f))]
-
-        output_fmt = getattr(self, "live_format_combo", None)
-        output_fmt = output_fmt.currentText() if output_fmt else "mkv"
+        all_files = [f for f in os.listdir(live_dir) if os.path.isfile(os.path.join(live_dir, f))]
+        output_fmt = "mkv"
 
         def _set_status(text, color="#ffb300"):
             self.live_status_lbl.setText(text)
-            self.live_status_lbl.setStyleSheet(
-                f"font-size:15px; font-weight:bold; color:{color};"
-            )
+            self.live_status_lbl.setStyleSheet(f"font-size:15px; font-weight:bold; color:{color};")
 
-        def _run_ffmpeg(cmd, source_files, output):
+        def _execute_ffmpeg(cmd, source_files, output):
+            kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
             try:
-                result = subprocess.run(
-                    cmd, capture_output=True,
-                    encoding="utf-8", errors="replace",
-                    timeout=600,
-                )
-                if result.returncode == 0 and os.path.exists(output):
+                # FFmpeg'i çalıştır, hataları görmezden gel, dosyaya odaklan
+                subprocess.run(cmd, capture_output=True, timeout=600, **kwargs)
+                
+                if os.path.exists(output) and os.path.getsize(output) > 1024:
                     for f in source_files:
                         try: os.remove(f)
-                        except Exception: pass
+                        except: pass
                     self._cleanup_temp_files(live_dir)
                     size_mb = os.path.getsize(output) / 1024 ** 2
-                    _set_status(f"\u2705  Saved \u2192 {size_mb:.1f} MB", "#4caf50")
-                    self._show_done_dialog(output, title="Recording Stopped \u2014 Recovered")
-                    return output  # ← Return the output path
+                    _set_status(f"✅  Saved → {size_mb:.1f} MB", "#4caf50")
+                    if getattr(self, "_live_stopped_by_user", False):
+                        self._show_done_dialog(output, title="Recording Stopped")
+                    return output
                 else:
-                    err = ((result.stderr or "") + (result.stdout or ""))[-300:]
-                    _set_status(f"\u274c  FFmpeg error: {err[:120]}", "#f44336")
+                    _set_status("❌  FFmpeg failed to create file.", "#f44336")
                     return ""
-            except FileNotFoundError:
-                _set_status("\u274c  FFmpeg not found. Files kept.", "#f44336")
-                return ""
-            except subprocess.TimeoutExpired:
-                _set_status("\u274c  FFmpeg timed out (>10 min).", "#f44336")
-                return ""
             except Exception as e:
-                _set_status(f"\u274c  Error: {e}", "#f44336")
+                _set_status(f"❌  Error: {e}", "#f44336")
                 return ""
 
-        # ── Case A: complete stream files (ePzWqox8T-A.f299.mkv style) ──
-        stream_files = [
-            os.path.join(live_dir, f) for f in all_files
-            if re.search(r"\.f\d+\.[a-z0-9]{2,4}$", f, re.IGNORECASE)
-            and not re.search(r"\.(part|ytdl)", f, re.IGNORECASE)
-        ]
-        if stream_files:
-            stream_files.sort(key=os.path.getsize, reverse=True)
-            video_file = stream_files[0]
-            audio_file = stream_files[1] if len(stream_files) > 1 else None
+        # 1. Tamamlanmış (bitmiş) dosyaları bul
+        stream_files = [os.path.join(live_dir, f) for f in all_files 
+                        if re.search(r"\.f\d+\.[a-z0-9]{2,4}$", f, re.IGNORECASE) 
+                        and not re.search(r"\.(part|ytdl)", f, re.IGNORECASE)]
+        
+        # 2. Veya parça (part) dosyalarını bul
+        if not stream_files:
+            stream_files = [os.path.join(live_dir, f) for f in all_files 
+                            if re.search(r"\.(part|part-Frag\d+)$", f, re.IGNORECASE)]
 
-            raw_base = re.sub(r"\.f\d+\.[a-z0-9]{2,4}$", "",
-                              os.path.basename(video_file), flags=re.IGNORECASE)
-            output = os.path.join(live_dir, f"{raw_base}_merged.{output_fmt}")
-
-            if audio_file:
-                _set_status("\U0001f500  Muxing video + audio with FFmpeg...")
-                QApplication.processEvents()
-                result = _run_ffmpeg(
-                    ["ffmpeg", "-y", "-fflags", "+igndts", "-i", video_file, "-i", audio_file,
-                     "-c", "copy", "-shortest", "-movflags", "+faststart", output],
-                    stream_files, output
-                )
-                if result:
-                    return result
-            else:
-                _set_status("\U0001f500  Remuxing with FFmpeg...")
-                QApplication.processEvents()
-                result = _run_ffmpeg(
-                    ["ffmpeg", "-y", "-i", video_file, "-c", "copy", output],
-                    stream_files, output
-                )
-                if result:
-                    return result
+        if not stream_files:
+            _set_status("⏹  Stopped. No files found.", "#ffb300")
             return ""
 
-        # ── Case B: accumulating part files (id.fNNN.ext.part-FragN) ────
-        # yt-dlp writes ALL fragment content into ONE accumulating file per stream.
-        # "part-Frag68" means 68 fragments have been written to that single file.
-        # We just need to DIRECTLY MUX the two partial files — no concat needed.
-        part_files = []
-        for fname in all_files:
-            # Match both ePzWqox8T-A.f299.mkv.part-Frag68  AND  title.f299.mkv.part
-            if re.search(r"\.f\d+\.[a-z0-9]{2,4}\.part(-Frag\d+)?$", fname, re.IGNORECASE):
-                part_files.append(os.path.join(live_dir, fname))
+        stream_files.sort(key=os.path.getsize, reverse=True)
+        video_file = stream_files[0]
+        audio_file = stream_files[1] if len(stream_files) > 1 else None
 
-        if not part_files:
-            _set_status("⏹  Stopped. No recoverable files found.")
-            return
+        stream_title = getattr(self, "_live_stream_title", "Stream")
+        safe_title = re.sub(r'[<>:"/\\|?*]', '_', stream_title)
+        output = os.path.join(live_dir, f"{safe_title}.{output_fmt}")
 
-        # Largest = video stream, second = audio stream
-        part_files.sort(key=os.path.getsize, reverse=True)
-        video_part = part_files[0]
-        audio_part = part_files[1] if len(part_files) > 1 else None
+        _set_status("🔀  Finalizing recording...", "#ffb300")
+        QApplication.processEvents()
 
-        # Build clean output name: strip .part-FragN and .fNNN.ext
-        raw_base = re.sub(r"\.part(-Frag\d+)?$", "",
-                          os.path.basename(video_part), flags=re.IGNORECASE)
-        raw_base = re.sub(r"\.f\d+\.[a-z0-9]{2,4}$", "", raw_base, flags=re.IGNORECASE)
-        output = os.path.join(live_dir, f"{raw_base}_recovered.{output_fmt}")
-
-        if audio_part:
-            _set_status(f"🔀  Muxing {len(part_files)} stream files with FFmpeg...")
-            QApplication.processEvents()
-            cmd = ["ffmpeg", "-y", "-fflags", "+igndts",
-                   "-i", video_part, "-i", audio_part,
+        if audio_file:
+            cmd = ["ffmpeg", "-y", "-fflags", "+igndts", "-i", video_file, "-i", audio_file,
                    "-c", "copy", "-shortest", "-movflags", "+faststart", output]
         else:
-            _set_status("🔀  Remuxing partial recording with FFmpeg...")
-            QApplication.processEvents()
-            cmd = ["ffmpeg", "-y", "-fflags", "+igndts", "-i", video_part, "-c", "copy", "-movflags", "+faststart", output]
+            cmd = ["ffmpeg", "-y", "-fflags", "+igndts", "-i", video_file, "-c", "copy", "-movflags", "+faststart", output]
 
-        return _run_ffmpeg(cmd, part_files, output)
+        return _execute_ffmpeg(cmd, stream_files, output)
+    
     def _cleanup_temp_files(self, directory: str):
-        """Remove .ytdl, .part, .part-FragN, and leftover concat list files."""
+        """Remove .ytdl, .part, .part-FragN, debug log, and leftover concat list files."""
         if not os.path.isdir(directory):
             return
         for f in os.listdir(directory):
             if (re.search(r"\.(ytdl|part)(-Frag\d+)?$", f, re.IGNORECASE)
-                    or f in ("_ytl_v.txt", "_ytl_a.txt")):
+                    or f in ("_ytl_v.txt", "_ytl_a.txt", "_debug.log") 
+                    or f.endswith("_debug.log")):
                 try:
                     os.remove(os.path.join(directory, f))
                 except Exception:
@@ -3032,17 +2964,13 @@ class VideoDownloader(QMainWindow):
         self.live_start_btn.setEnabled(True)
         self.live_stop_btn.setEnabled(False)
         self.live_progress_bar.setVisible(False)
-
-    # ══════════════════════════════════════════════════════
-    #  4. VIDEO CODEC TAB
-    # ══════════════════════════════════════════════════════
+        self._live_stopped_by_user = False
 
     # ══════════════════════════════════════════════════════
     #  4. VIDEO CODEC TAB
     # ══════════════════════════════════════════════════════
 
     def setup_codec_tab(self):
-        # Eski bozuk düzen kalıntılarını temizle (Çiftleşmeyi %100 önler)
         if self.codec_tab.layout():
             QWidget().setLayout(self.codec_tab.layout())
 
@@ -3050,59 +2978,65 @@ class VideoDownloader(QMainWindow):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
 
-        # Header
+        # 1. HEADER
         header = QWidget()
-        header.setStyleSheet("QWidget{background-color:#363636;border-radius:8px;padding:8px;}")
+        header.setStyleSheet("QWidget{background-color:#363636; border-radius:8px; padding:8px;}")
         h_lyt = QHBoxLayout(header)
         h_lyt.setContentsMargins(10, 0, 10, 0)
         h_lyt.setSpacing(10)
         ic = QLabel()
-        
-        # İkon sorunu için get_resource_path kullandık
         ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         h_lyt.addWidget(ic)
-        h_lyt.addWidget(_make_label("Video Codec Editor", "color:#fff;font-size:16px;font-weight:bold;"))
-        h_lyt.addWidget(_make_label("Convert video files to different codecs.", "color:#b0b0b0;font-size:12px;"), 1)
+        h_lyt.addWidget(_make_label("Video Codec Editor", "color:#fff; font-size:16px; font-weight:bold;"))
+        h_lyt.addWidget(_make_label("Convert video files to different formats and codecs.", "color:#b0b0b0; font-size:12px;"), 1)
         layout.addWidget(header)
 
-        # File selection
-        file_container = QWidget()
-        file_container.setStyleSheet("QWidget{background-color:#363636;border-radius:8px;padding:8px;}")
-        fc_lyt = QHBoxLayout(file_container)
-        fc_lyt.setContentsMargins(10, 5, 10, 5)
-        fc_lyt.setSpacing(8)
+        # 2. FILE SELECTION CARD
+        file_card = QWidget()
+        file_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        fc_lyt = QVBoxLayout(file_card)
+        fc_lyt.setContentsMargins(15, 15, 15, 15)
+        
+        input_row = QHBoxLayout()
+        input_row.setSpacing(10)
         self.codec_file_input = QLineEdit()
         self.codec_file_input.setPlaceholderText("Select a video file to convert...")
-        self.codec_file_input.setMinimumHeight(36)
+        self.codec_file_input.setMinimumHeight(40)
         self.codec_file_input.setStyleSheet(_INPUT)
         
         self.codec_browse_button = QPushButton("Browse")
-        self.codec_browse_button.setMinimumHeight(36)
-        self.codec_browse_button.setFixedWidth(100)
-        self.codec_browse_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.codec_browse_button.setMinimumHeight(40)
+        self.codec_browse_button.setFixedWidth(120)
         self.codec_browse_button.setStyleSheet(_BTN_BLUE)
         self.codec_browse_button.clicked.connect(self.browse_codec_file)
         
-        fc_lyt.addWidget(self.codec_file_input)
-        fc_lyt.addWidget(self.codec_browse_button)
-        layout.addWidget(file_container)
+        input_row.addWidget(self.codec_file_input)
+        input_row.addWidget(self.codec_browse_button)
+        fc_lyt.addLayout(input_row)
+        layout.addWidget(file_card)
 
-        # Codec options
-        codec_container = QGroupBox("🎞  Codec Settings")
-        form_layout = QFormLayout(codec_container)
+        # 3. CODEC SETTINGS CARD
+        codec_card = QWidget()
+        codec_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        cc_lyt = QVBoxLayout(codec_card)
+        cc_lyt.setContentsMargins(15, 15, 15, 15)
+        cc_lyt.setSpacing(12)
+
+        title_lbl = QLabel("🎞  Codec Settings")
+        title_lbl.setStyleSheet("color:#fff; font-size:14px; font-weight:bold; border:none;")
+        cc_lyt.addWidget(title_lbl)
+
+        form_layout = QFormLayout()
         form_layout.setSpacing(12)
-        form_layout.setContentsMargins(10, 10, 10, 10)
-
+        
         self.video_codec_combo = QComboBox()
         self.video_codec_combo.addItems(["Copy (Instant)", "H.264", "H.265", "VP9", "AV1"])
         self.video_codec_combo.setStyleSheet(_COMBO)
         self.video_codec_combo.currentTextChanged.connect(self._on_codec_changed)
-        form_layout.addRow("🎥  Video Codec:", self.video_codec_combo)
-
+        
         self.audio_codec_combo = QComboBox()
         self.audio_codec_combo.addItems(["AAC", "MP3", "Opus", "FLAC", "Copy"])
         self.audio_codec_combo.setStyleSheet(_COMBO)
-        form_layout.addRow("🔊  Audio Codec:", self.audio_codec_combo)
 
         self.acceleration_mode_combo = QComboBox()
         modes = getattr(self, '_cached_accel_modes', self.get_available_acceleration_modes())
@@ -3110,9 +3044,7 @@ class VideoDownloader(QMainWindow):
             self._cached_accel_modes = modes
         self.acceleration_mode_combo.addItems(modes)
         self.acceleration_mode_combo.setStyleSheet(_COMBO)
-        form_layout.addRow("⚡  Acceleration:", self.acceleration_mode_combo)
-
-        # PC'deki en iyi ekran kartını otomatik olarak bul ve listede seçili yap!
+        
         for pref in["NVIDIA", "AMD", "VAAPI", "Intel"]:
             match = next((m for m in modes if pref in m), None)
             if match:
@@ -3123,52 +3055,68 @@ class VideoDownloader(QMainWindow):
         self.codec_preset_combo.addItems(["veryfast", "fast", "medium (balanced)", "slow", "veryslow"])
         self.codec_preset_combo.setCurrentIndex(1)
         self.codec_preset_combo.setStyleSheet(_COMBO)
-        form_layout.addRow("🎚  Preset:", self.codec_preset_combo)
 
-        layout.addWidget(codec_container)
+        lbl_style = "color:#e0e0e0; font-size:13px; border:none;"
+        form_layout.addRow(_make_label("🎥  Video Codec:", lbl_style), self.video_codec_combo)
+        form_layout.addRow(_make_label("🔊  Audio Codec:", lbl_style), self.audio_codec_combo)
+        form_layout.addRow(_make_label("⚡  Acceleration:", lbl_style), self.acceleration_mode_combo)
+        form_layout.addRow(_make_label("🎚  Preset:", lbl_style), self.codec_preset_combo)
 
-        # Compatibility hint
+        cc_lyt.addLayout(form_layout)
+
         self.compat_hint = QLabel("")
-        self.compat_hint.setStyleSheet("color:#ffb300; font-size:12px; padding:8px; background-color:#2a2a2a; border-radius:4px;")
+        self.compat_hint.setStyleSheet("color:#ffb300; font-size:12px; padding:8px; background-color:#363636; border-radius:6px; border:none;")
         self.compat_hint.setWordWrap(True)
-        layout.addWidget(self.compat_hint)
+        self.compat_hint.hide()
+        cc_lyt.addWidget(self.compat_hint)
+        
+        layout.addWidget(codec_card)
 
-        # Convert button
+        # 4. ACTION & PROGRESS CARD
+        prog_card = QWidget()
+        prog_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        prog_lyt = QVBoxLayout(prog_card)
+        prog_lyt.setContentsMargins(15, 15, 15, 15)
+        prog_lyt.setSpacing(12)
+
         self.convert_button = QPushButton("🔄 Convert")
-        self.convert_button.setMinimumHeight(40)
-        self.convert_button.setStyleSheet(_BTN_BLUE)
+        self.convert_button.setMinimumHeight(42)
+        self.convert_button.setStyleSheet(_BTN_BLUE + "font-size:14px;")
         self.convert_button.clicked.connect(self.start_conversion)
-        layout.addWidget(self.convert_button)
-
-        # Progress
-        progress_container = QGroupBox("📊  Conversion Progress")
-        prog_lyt = QVBoxLayout(progress_container)
-        prog_lyt.setSpacing(10)
+        prog_lyt.addWidget(self.convert_button)
 
         self.codec_progress = QProgressBar()
-        self.codec_progress.setMinimumHeight(25)
+        self.codec_progress.setMinimumHeight(18)
+        self.codec_progress.setStyleSheet("""
+            QProgressBar { border: none; background-color: #3a3a3a; border-radius: 9px; color: white; text-align: center; font-size: 11px; font-weight: bold;} 
+            QProgressBar::chunk { background-color: #2196f3; border-radius: 9px; }
+        """)
         prog_lyt.addWidget(self.codec_progress)
 
-        det_row = QWidget()
-        det_lyt = QHBoxLayout(det_row)
-        det_lyt.setContentsMargins(0, 0, 0, 0)
-        det_lyt.setSpacing(15)
-        self.conversion_speed   = QLabel("⚡ Speed: -- fps")
-        self.conversion_time    = QLabel("⏱ Time: --:--:--")
-        self.conversion_eta     = QLabel("🕒 ETA: --:--:--")
-        self.conversion_percent = QLabel("📊 Progress: 0%")
-        for lbl in (self.conversion_speed, self.conversion_time, self.conversion_eta, self.conversion_percent):
-            lbl.setStyleSheet("color:#b0b0b0; font-size:12px;")
-            det_lyt.addWidget(lbl, 1)
-        prog_lyt.addWidget(det_row)
-        layout.addWidget(progress_container)
+        det_row = QHBoxLayout()
+        self.conversion_percent = QLabel("Progress: 0%")
+        self.conversion_speed   = QLabel("Speed: -- fps")
+        self.conversion_time    = QLabel("Time: --:--:--")
+        self.conversion_eta     = QLabel("Remaining: --:--:--")
+        for lbl in (self.conversion_percent, self.conversion_speed, self.conversion_time, self.conversion_eta):
+            lbl.setStyleSheet("color:#b0b0b0; font-size:12px; font-weight:bold; border:none;")
+            det_row.addWidget(lbl)
+        det_row.addStretch()
+        prog_lyt.addLayout(det_row)
+
+        layout.addWidget(prog_card)
         layout.addStretch()
 
     def _on_codec_changed(self):
         vc = self.video_codec_combo.currentText()
         ac = self.audio_codec_combo.currentText()
         hint = self._get_compat_hint(vc, ac)
-        self.compat_hint.setText(hint)
+        if hint:
+            self.compat_hint.setText(hint)
+            self.compat_hint.show()
+        else:
+            self.compat_hint.setText("")
+            self.compat_hint.hide()
 
     def _get_compat_hint(self, video_codec: str, audio_codec: str) -> str:
         hints =[]
@@ -3200,25 +3148,41 @@ class VideoDownloader(QMainWindow):
             self._on_codec_changed()
 
     def detect_gpu(self) -> str:
-        if shutil.which("nvidia-smi"): return "NVIDIA"
+        if shutil.which("nvidia-smi"):
+            return "NVIDIA"
         if os.name == "nt":
             try:
-                out = subprocess.check_output(["wmic", "path", "win32_VideoController", "get", "Name"], encoding='utf-8', errors='replace', stderr=subprocess.DEVNULL)
+                kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW}
+                out = subprocess.check_output(["wmic", "path", "win32_VideoController", "get", "Name"],
+                    encoding='utf-8', errors='replace', stderr=subprocess.DEVNULL,
+                    **kwargs
+                )
                 up = out.upper()
-                if "AMD" in up: return "AMD_APU" if "APU" in up else "AMD"
-            except: pass
-        if shutil.which("vainfo"): return "VAAPI"
+                if "AMD" in up:
+                    return "AMD_APU" if "APU" in up else "AMD"
+            except Exception:
+                pass
+        if shutil.which("vainfo"):
+            return "VAAPI"
         return "CPU"
 
     def get_available_acceleration_modes(self) -> list:
-        modes =["CPU"]
-        if shutil.which("nvidia-smi"): modes.append("NVIDIA (NVENC)")
+        modes = ["CPU"]
+        if shutil.which("nvidia-smi"):
+            modes.append("NVIDIA (NVENC)")
         if os.name == "nt":
             try:
-                out = subprocess.check_output(["wmic", "path", "win32_VideoController", "get", "Name"], encoding='utf-8', errors='replace', stderr=subprocess.DEVNULL).upper()
-                if "AMD" in out: modes.append("AMD APU (AMF)" if "APU" in out else "AMD (AMF)")
-            except: pass
-        if shutil.which("vainfo"): modes.append("Intel/AMD (VAAPI)")
+                kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW}
+                out = subprocess.check_output(["wmic", "path", "win32_VideoController", "get", "Name"],
+                    encoding='utf-8', errors='replace', stderr=subprocess.DEVNULL,
+                    **kwargs
+                ).upper()
+                if "AMD" in out:
+                    modes.append("AMD APU (AMF)" if "APU" in out else "AMD (AMF)")
+            except Exception:
+                pass
+        if shutil.which("vainfo"):
+            modes.append("Intel/AMD (VAAPI)")
         return modes
 
     def start_conversion(self):
@@ -3260,7 +3224,6 @@ class VideoDownloader(QMainWindow):
         if "Copy" in cur_vc:
             video_codec = "copy"
             best_ext = self._get_best_container("copy", audio_codec)
-            # DÜZELTİLDİ: MKV içindeki resmi/altyazıyı at, sadece video+ses'i kopyala
             extra_params =["-sn", "-map", "0:v:0", "-map", "0:a?"]
         else:
             cpu_video_codec = video_codec_map.get(cur_vc, "libx264")
@@ -3352,64 +3315,167 @@ class VideoDownloader(QMainWindow):
     # ══════════════════════════════════════════════════════
 
     def setup_history_tab(self):
+        if self.history_tab.layout():
+            QWidget().setLayout(self.history_tab.layout())
+            
         layout = QVBoxLayout(self.history_tab)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
 
+        # Header
+        header = QWidget()
+        header.setStyleSheet("QWidget{background-color:#363636; border-radius:8px; padding:8px;}")
+        hdr_lyt = QHBoxLayout(header)
+        hdr_lyt.setContentsMargins(10, 0, 10, 0)
+        hdr_lyt.setSpacing(10)
+        ic = QLabel()
+        ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        hdr_lyt.addWidget(ic)
+        hdr_lyt.addWidget(_make_label("Download History", "color:#fff; font-size:16px; font-weight:bold;"))
+        hdr_lyt.addWidget(_make_label("View and manage your previous downloads.", "color:#b0b0b0; font-size:12px;"), 1)
+        layout.addWidget(header)
+
+        # Table Card
+        table_card = QWidget()
+        table_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        tc_lyt = QVBoxLayout(table_card)
+        tc_lyt.setContentsMargins(15, 15, 15, 15)
+        
         self.history_table = QTableWidget()
         self.history_table.setColumnCount(5)
-        self.history_table.setHorizontalHeaderLabels(
-            ["Date", "File Name", "URL", "Status", "FilePath"]
-        )
+        self.history_table.setHorizontalHeaderLabels(["Date", "File Name", "URL", "Status", "FilePath"])
         hdr = self.history_table.horizontalHeader()
-        # Date — fixed
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        # File Name — stretch to fill available space
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        # URL — interactive (user can resize)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         self.history_table.setColumnWidth(2, 220)
-        # Status — fixed
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        # Hidden filepath
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-
+        self.history_table.setColumnHidden(4, True)
         self.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.history_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.history_table.setAlternatingRowColors(True)
-        self.history_table.setColumnHidden(4, True)
-        self.history_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.history_table.verticalHeader().setVisible(False)
-        self.history_table.setWordWrap(False)
-        layout.addWidget(self.history_table)
+        self.history_table.setShowGrid(False)
+        self.history_table.setStyleSheet("""
+            QTableWidget { background-color: #242424; border: 1px solid #3d3d3d; border-radius: 6px; outline: none; }
+            QTableWidget::item { border-bottom: 1px solid #333333; padding: 6px; color:#e0e0e0; }
+            QTableWidget::item:selected { background-color: #1976d2; color: #fff;}
+            QHeaderView::section { background-color: #2d2d2d; color: #90caf9; padding: 8px; border: none; border-bottom: 2px solid #1976d2; font-size: 13px; font-weight: bold; }
+        """)
+        tc_lyt.addWidget(self.history_table)
+        layout.addWidget(table_card, 1)
 
-        btn_widget = QWidget()
-        btn_lyt    = QHBoxLayout(btn_widget)
-        btn_lyt.setContentsMargins(0, 0, 0, 0)
+        # Actions Card
+        action_card = QWidget()
+        action_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        ac_lyt = QHBoxLayout(action_card)
+        ac_lyt.setContentsMargins(15, 10, 15, 10)
+        ac_lyt.setSpacing(10)
 
-        self.open_file_button      = QPushButton("📂  Open File")
+        self.open_file_button = QPushButton("📂  Open File")
         self.show_in_folder_button = QPushButton("📁  Show in Folder")
-        self.clear_history_button  = QPushButton("🗑  Clear History")
+        self.clear_history_button = QPushButton("🗑  Clear History")
+        
         for b in (self.open_file_button, self.show_in_folder_button):
             b.setStyleSheet(_BTN_BLUE)
-            b.setMinimumHeight(36)
+            b.setMinimumHeight(38)
+            b.setEnabled(False)
+            
         self.clear_history_button.setStyleSheet(_BTN_RED)
-        self.clear_history_button.setMinimumHeight(36)
+        self.clear_history_button.setMinimumHeight(38)
 
         self.open_file_button.clicked.connect(self.open_selected_file)
         self.show_in_folder_button.clicked.connect(self.show_in_folder)
         self.clear_history_button.clicked.connect(self.clear_history)
-
-        self.open_file_button.setEnabled(False)
-        self.show_in_folder_button.setEnabled(False)
-
-        btn_lyt.addWidget(self.open_file_button)
-        btn_lyt.addWidget(self.show_in_folder_button)
-        btn_lyt.addStretch()
-        btn_lyt.addWidget(self.clear_history_button)
-        layout.addWidget(btn_widget)
-
         self.history_table.itemSelectionChanged.connect(self.update_history_buttons)
+
+        ac_lyt.addWidget(self.open_file_button)
+        ac_lyt.addWidget(self.show_in_folder_button)
+        ac_lyt.addStretch()
+        ac_lyt.addWidget(self.clear_history_button)
+        layout.addWidget(action_card)
+
+        self.init_database()
+        self.load_history()
+
+
+        if self.history_tab.layout():
+            QWidget().setLayout(self.history_tab.layout())
+            
+        layout = QVBoxLayout(self.history_tab)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+
+        # Header
+        header = QWidget()
+        header.setStyleSheet("QWidget{background-color:#363636; border-radius:8px; padding:8px;}")
+        hdr_lyt = QHBoxLayout(header)
+        hdr_lyt.setContentsMargins(10, 0, 10, 0)
+        hdr_lyt.setSpacing(10)
+        ic = QLabel()
+        ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        hdr_lyt.addWidget(ic)
+        hdr_lyt.addWidget(_make_label("Download History", "color:#fff; font-size:16px; font-weight:bold;"))
+        hdr_lyt.addWidget(_make_label("View and manage your previous downloads.", "color:#b0b0b0; font-size:12px;"), 1)
+        layout.addWidget(header)
+
+        # Table Card
+        table_card = QWidget()
+        table_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        tc_lyt = QVBoxLayout(table_card)
+        tc_lyt.setContentsMargins(15, 15, 15, 15)
+        
+        self.history_table = QTableWidget()
+        self.history_table.setColumnCount(5)
+        self.history_table.setHorizontalHeaderLabels(["Date", "File Name", "URL", "Status", "FilePath"])
+        hdr = self.history_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.history_table.setColumnWidth(2, 220)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.history_table.setColumnHidden(4, True)
+        self.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.history_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.setShowGrid(False)
+        self.history_table.setStyleSheet("""
+            QTableWidget { background-color: #242424; border: 1px solid #3d3d3d; border-radius: 6px; outline: none; }
+            QTableWidget::item { border-bottom: 1px solid #333333; padding: 6px; color:#e0e0e0; }
+            QTableWidget::item:selected { background-color: #1976d2; color: #fff;}
+            QHeaderView::section { background-color: #2d2d2d; color: #90caf9; padding: 8px; border: none; border-bottom: 2px solid #1976d2; font-size: 13px; font-weight: bold; }
+        """)
+        tc_lyt.addWidget(self.history_table)
+        layout.addWidget(table_card, 1)
+
+        # Actions Card
+        action_card = QWidget()
+        action_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        ac_lyt = QHBoxLayout(action_card)
+        ac_lyt.setContentsMargins(15, 10, 15, 10)
+        ac_lyt.setSpacing(10)
+
+        self.open_file_button = QPushButton("📂  Open File")
+        self.show_in_folder_button = QPushButton("📁  Show in Folder")
+        self.clear_history_button = QPushButton("🗑  Clear History")
+        
+        for b in (self.open_file_button, self.show_in_folder_button):
+            b.setStyleSheet(_BTN_BLUE)
+            b.setMinimumHeight(38)
+            b.setEnabled(False)
+            
+        self.clear_history_button.setStyleSheet(_BTN_RED)
+        self.clear_history_button.setMinimumHeight(38)
+
+        self.open_file_button.clicked.connect(self.open_selected_file)
+        self.show_in_folder_button.clicked.connect(self.show_in_folder)
+        self.clear_history_button.clicked.connect(self.clear_history)
+        self.history_table.itemSelectionChanged.connect(self.update_history_buttons)
+
+        ac_lyt.addWidget(self.open_file_button)
+        ac_lyt.addWidget(self.show_in_folder_button)
+        ac_lyt.addStretch()
+        ac_lyt.addWidget(self.clear_history_button)
+        layout.addWidget(action_card)
 
         self.init_database()
         self.load_history()
@@ -3616,102 +3682,228 @@ class VideoDownloader(QMainWindow):
     # ══════════════════════════════════════════════════════
 
     def setup_settings_tab(self):
+        if self.settings_tab.layout():
+            QWidget().setLayout(self.settings_tab.layout())
+
         layout = QVBoxLayout(self.settings_tab)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
 
-        # Header
+        # 1. HEADER
         header = QWidget()
-        header.setStyleSheet(
-            "QWidget{background-color:#363636;border-radius:8px;padding:5px;}"
-        )
-        h_lyt = QHBoxLayout(header)
-        h_lyt.setContentsMargins(0, 0, 0, 0)
+        header.setStyleSheet("QWidget{background-color:#363636; border-radius:8px; padding:8px;}")
+        hdr_lyt = QHBoxLayout(header)
+        hdr_lyt.setContentsMargins(10, 0, 10, 0)
+        hdr_lyt.setSpacing(10)
         ic = QLabel()
-        ic.setPixmap(
-            QPixmap(get_resource_path("icon.ico")).scaled(
-                32, 32,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
-        h_lyt.addWidget(ic)
-        tc = QWidget()
-        tl = QVBoxLayout(tc)
-        tl.setContentsMargins(0, 0, 0, 0)
-        tl.setSpacing(2)
-        tl.addWidget(_make_label("App Settings", "color:#fff;font-size:16px;font-weight:bold;"))
-        tl.addWidget(_make_label("Configure download folder and quality defaults.",
-                                 "color:#b0b0b0;font-size:12px;"))
-        h_lyt.addWidget(tc, 1)
+        ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        hdr_lyt.addWidget(ic)
+        hdr_lyt.addWidget(_make_label("App Settings", "color:#fff; font-size:16px; font-weight:bold;"))
+        hdr_lyt.addWidget(_make_label("Configure download folder and default qualities.", "color:#b0b0b0; font-size:12px;"), 1)
         layout.addWidget(header)
 
-        # Download folder
-        folder_group = QGroupBox("📥  Download Folder")
-        folder_lyt   = QHBoxLayout(folder_group)
+        # 2. DOWNLOAD FOLDER CARD
+        folder_card = QWidget()
+        folder_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        fc_lyt = QVBoxLayout(folder_card)
+        fc_lyt.setContentsMargins(15, 15, 15, 15)
+        fc_lyt.setSpacing(10)
+        
+        fc_title = QLabel("📥  Download Folder")
+        fc_title.setStyleSheet("color:#fff; font-size:14px; font-weight:bold; border:none;")
+        fc_lyt.addWidget(fc_title)
 
+        row_f = QHBoxLayout()
         self.folder_input = QLineEdit()
         self.folder_input.setPlaceholderText("Select a download folder...")
+        self.folder_input.setMinimumHeight(40)
         self.folder_input.setStyleSheet(_INPUT)
-
+        
         self.folder_browse_button = QPushButton("Browse")
+        self.folder_browse_button.setMinimumHeight(40)
+        self.folder_browse_button.setFixedWidth(120)
         self.folder_browse_button.setStyleSheet(_BTN_BLUE)
         self.folder_browse_button.clicked.connect(self.browse_download_folder)
 
-        folder_lyt.addWidget(self.folder_input)
-        folder_lyt.addWidget(self.folder_browse_button)
-        layout.addWidget(folder_group)
+        row_f.addWidget(self.folder_input)
+        row_f.addWidget(self.folder_browse_button)
+        fc_lyt.addLayout(row_f)
+        layout.addWidget(folder_card)
 
-        # FFmpeg status
-        ffmpeg_group = QGroupBox("🎬  FFmpeg Status")
-        ffmpeg_lyt   = QVBoxLayout(ffmpeg_group)
+        # 3. DEFAULTS CARD
+        qual_card = QWidget()
+        qual_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        qc_lyt = QVBoxLayout(qual_card)
+        qc_lyt.setContentsMargins(15, 15, 15, 15)
+        qc_lyt.setSpacing(10)
 
-        self.ffmpeg_status = QLabel("Checking FFmpeg status...")
-        self.ffmpeg_status.setStyleSheet("color:#fff; font-size:13px; padding:5px;")
-        ffmpeg_lyt.addWidget(self.ffmpeg_status)
+        qc_title = QLabel("⚙️  Default Quality Settings")
+        qc_title.setStyleSheet("color:#fff; font-size:14px; font-weight:bold; border:none;")
+        qc_lyt.addWidget(qc_title)
 
-        self.ffmpeg_download_button = QPushButton("Download & Install FFmpeg")
-        self.ffmpeg_download_button.setStyleSheet(_BTN_BLUE)
-        self.ffmpeg_download_button.clicked.connect(self.download_ffmpeg)
-        self.ffmpeg_download_button.hide()
-        ffmpeg_lyt.addWidget(self.ffmpeg_download_button)
-        layout.addWidget(ffmpeg_group)
-
-        # Quality defaults
-        quality_group = QGroupBox("⚙️  Default Quality")
-        quality_lyt   = QVBoxLayout(quality_group)
-
-        def _q_row(label_text, combo_widget):
-            row = QWidget()
-            rl  = QHBoxLayout(row)
-            rl.setContentsMargins(0, 0, 0, 0)
-            lbl = QLabel(label_text)
-            lbl.setStyleSheet("color:#fff; font-size:13px;")
-            rl.addWidget(lbl)
-            rl.addWidget(combo_widget)
-            rl.addStretch()
-            return row
-
+        form_q = QFormLayout()
+        form_q.setSpacing(15)
         self.video_quality_combo = QComboBox()
         self.video_quality_combo.addItems(["Best", "1080p", "720p", "480p", "360p"])
         self.video_quality_combo.setStyleSheet(_COMBO)
-        quality_lyt.addWidget(_q_row("🎥  Video Quality:", self.video_quality_combo))
+        self.video_quality_combo.setFixedWidth(200)
 
         self.audio_quality_combo = QComboBox()
         self.audio_quality_combo.addItems(["Best", "320k", "256k", "192k", "128k", "96k"])
         self.audio_quality_combo.setStyleSheet(_COMBO)
-        quality_lyt.addWidget(_q_row("🔊  Audio Quality:", self.audio_quality_combo))
-        layout.addWidget(quality_group)
+        self.audio_quality_combo.setFixedWidth(200)
 
-        # Save button
+        lbl_style = "color:#e0e0e0; font-size:13px; border:none;"
+        form_q.addRow(_make_label("🎥  Video Quality:", lbl_style), self.video_quality_combo)
+        form_q.addRow(_make_label("🔊  Audio Quality:", lbl_style), self.audio_quality_combo)
+        qc_lyt.addLayout(form_q)
+        layout.addWidget(qual_card)
+
+        # 4. FFMPEG CARD
+        ffmpeg_card = QWidget()
+        ffmpeg_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        ff_lyt = QVBoxLayout(ffmpeg_card)
+        ff_lyt.setContentsMargins(15, 15, 15, 15)
+        ff_lyt.setSpacing(10)
+
+        ff_title = QLabel("🎬  FFmpeg Status")
+        ff_title.setStyleSheet("color:#fff; font-size:14px; font-weight:bold; border:none;")
+        ff_lyt.addWidget(ff_title)
+
+        self.ffmpeg_status = QLabel("Checking FFmpeg status...")
+        self.ffmpeg_status.setStyleSheet("color:#b0b0b0; font-size:13px; border:none;")
+        ff_lyt.addWidget(self.ffmpeg_status)
+
+        self.ffmpeg_download_button = QPushButton("⬇ Download & Install FFmpeg")
+        self.ffmpeg_download_button.setMinimumHeight(38)
+        self.ffmpeg_download_button.setFixedWidth(250)
+        self.ffmpeg_download_button.setStyleSheet(_BTN_BLUE)
+        self.ffmpeg_download_button.clicked.connect(self.download_ffmpeg)
+        self.ffmpeg_download_button.hide()
+        ff_lyt.addWidget(self.ffmpeg_download_button)
+        layout.addWidget(ffmpeg_card)
+
+        # 5. SAVE BUTTON
         save_btn = QPushButton("💾  Save Settings")
-        save_btn.setStyleSheet(_BTN_BLUE)
-        save_btn.setMinimumHeight(42)
+        save_btn.setMinimumHeight(45)
+        save_btn.setStyleSheet(_BTN_BLUE + "font-size:14px;")
         save_btn.clicked.connect(self.save_settings)
         layout.addWidget(save_btn)
+        
         layout.addStretch()
 
-        # Check FFmpeg on load
+        self.update_ffmpeg_status()
+
+        if self.settings_tab.layout():
+            QWidget().setLayout(self.settings_tab.layout())
+
+        layout = QVBoxLayout(self.settings_tab)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+
+        # 1. HEADER
+        header = QWidget()
+        header.setStyleSheet("QWidget{background-color:#363636; border-radius:8px; padding:8px;}")
+        hdr_lyt = QHBoxLayout(header)
+        hdr_lyt.setContentsMargins(10, 0, 10, 0)
+        hdr_lyt.setSpacing(10)
+        ic = QLabel()
+        ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        hdr_lyt.addWidget(ic)
+        hdr_lyt.addWidget(_make_label("App Settings", "color:#fff; font-size:16px; font-weight:bold;"))
+        hdr_lyt.addWidget(_make_label("Configure download folder and default qualities.", "color:#b0b0b0; font-size:12px;"), 1)
+        layout.addWidget(header)
+
+        # 2. DOWNLOAD FOLDER CARD
+        folder_card = QWidget()
+        folder_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        fc_lyt = QVBoxLayout(folder_card)
+        fc_lyt.setContentsMargins(15, 15, 15, 15)
+        fc_lyt.setSpacing(10)
+        
+        fc_title = QLabel("📥  Download Folder")
+        fc_title.setStyleSheet("color:#fff; font-size:14px; font-weight:bold; border:none;")
+        fc_lyt.addWidget(fc_title)
+
+        row_f = QHBoxLayout()
+        self.folder_input = QLineEdit()
+        self.folder_input.setPlaceholderText("Select a download folder...")
+        self.folder_input.setMinimumHeight(40)
+        self.folder_input.setStyleSheet(_INPUT)
+        
+        self.folder_browse_button = QPushButton("Browse")
+        self.folder_browse_button.setMinimumHeight(40)
+        self.folder_browse_button.setFixedWidth(120)
+        self.folder_browse_button.setStyleSheet(_BTN_BLUE)
+        self.folder_browse_button.clicked.connect(self.browse_download_folder)
+
+        row_f.addWidget(self.folder_input)
+        row_f.addWidget(self.folder_browse_button)
+        fc_lyt.addLayout(row_f)
+        layout.addWidget(folder_card)
+
+        # 3. DEFAULTS CARD
+        qual_card = QWidget()
+        qual_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        qc_lyt = QVBoxLayout(qual_card)
+        qc_lyt.setContentsMargins(15, 15, 15, 15)
+        qc_lyt.setSpacing(10)
+
+        qc_title = QLabel("⚙️  Default Quality Settings")
+        qc_title.setStyleSheet("color:#fff; font-size:14px; font-weight:bold; border:none;")
+        qc_lyt.addWidget(qc_title)
+
+        form_q = QFormLayout()
+        form_q.setSpacing(15)
+        self.video_quality_combo = QComboBox()
+        self.video_quality_combo.addItems(["Best", "1080p", "720p", "480p", "360p"])
+        self.video_quality_combo.setStyleSheet(_COMBO)
+        self.video_quality_combo.setFixedWidth(200)
+
+        self.audio_quality_combo = QComboBox()
+        self.audio_quality_combo.addItems(["Best", "320k", "256k", "192k", "128k", "96k"])
+        self.audio_quality_combo.setStyleSheet(_COMBO)
+        self.audio_quality_combo.setFixedWidth(200)
+
+        lbl_style = "color:#e0e0e0; font-size:13px; border:none;"
+        form_q.addRow(_make_label("🎥  Video Quality:", lbl_style), self.video_quality_combo)
+        form_q.addRow(_make_label("🔊  Audio Quality:", lbl_style), self.audio_quality_combo)
+        qc_lyt.addLayout(form_q)
+        layout.addWidget(qual_card)
+
+        # 4. FFMPEG CARD
+        ffmpeg_card = QWidget()
+        ffmpeg_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        ff_lyt = QVBoxLayout(ffmpeg_card)
+        ff_lyt.setContentsMargins(15, 15, 15, 15)
+        ff_lyt.setSpacing(10)
+
+        ff_title = QLabel("🎬  FFmpeg Status")
+        ff_title.setStyleSheet("color:#fff; font-size:14px; font-weight:bold; border:none;")
+        ff_lyt.addWidget(ff_title)
+
+        self.ffmpeg_status = QLabel("Checking FFmpeg status...")
+        self.ffmpeg_status.setStyleSheet("color:#b0b0b0; font-size:13px; border:none;")
+        ff_lyt.addWidget(self.ffmpeg_status)
+
+        self.ffmpeg_download_button = QPushButton("⬇ Download & Install FFmpeg")
+        self.ffmpeg_download_button.setMinimumHeight(38)
+        self.ffmpeg_download_button.setFixedWidth(250)
+        self.ffmpeg_download_button.setStyleSheet(_BTN_BLUE)
+        self.ffmpeg_download_button.clicked.connect(self.download_ffmpeg)
+        self.ffmpeg_download_button.hide()
+        ff_lyt.addWidget(self.ffmpeg_download_button)
+        layout.addWidget(ffmpeg_card)
+
+        # 5. SAVE BUTTON
+        save_btn = QPushButton("💾  Save Settings")
+        save_btn.setMinimumHeight(45)
+        save_btn.setStyleSheet(_BTN_BLUE + "font-size:14px;")
+        save_btn.clicked.connect(self.save_settings)
+        layout.addWidget(save_btn)
+        
+        layout.addStretch()
+
         self.update_ffmpeg_status()
 
     # ── Settings helpers ──────────────────────────────────
@@ -3725,6 +3917,36 @@ class VideoDownloader(QMainWindow):
             self.folder_input.setText(folder)
 
     def update_ffmpeg_status(self):
+        """Cross-platform FFmpeg detection via shutil.which."""
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path:
+            try:
+                # CMD penceresinin patlamasını engelleyen ayar
+                kwargs = {}
+                if os.name == "nt":
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+                ver_out = subprocess.run(
+                    ["ffmpeg", "-version"],
+                    capture_output=True, encoding='utf-8', errors='replace', timeout=5,
+                    **kwargs
+                ).stdout
+                ver_match = re.search(r"ffmpeg version ([\w.-]+)", ver_out)
+                ver_str = ver_match.group(1) if ver_match else "unknown"
+            except Exception:
+                ver_str = "unknown"
+
+            self.ffmpeg_status.setText(f"✅  FFmpeg {ver_str} — installed and ready.")
+            self.ffmpeg_status.setStyleSheet("QLabel{color:#4caf50;font-size:13px;padding:5px;}")
+            self.ffmpeg_download_button.hide()
+            if hasattr(self, "ffmpeg_warning_banner"):
+                self.ffmpeg_warning_banner.hide()
+        else:
+            self.ffmpeg_status.setText("❌  FFmpeg not found on this system.")
+            self.ffmpeg_status.setStyleSheet("QLabel{color:#f44336;font-size:13px;padding:5px;}")
+            self.ffmpeg_download_button.show()
+            if hasattr(self, "ffmpeg_warning_banner"):
+                self.ffmpeg_warning_banner.show()
         """Cross-platform FFmpeg detection via shutil.which."""
         # FIXED: was using subprocess(['where', 'ffmpeg']) which only works on Windows
         ffmpeg_path = shutil.which("ffmpeg")
@@ -3890,6 +4112,11 @@ def _make_label(text: str, style: str = "") -> QLabel:
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    
+    palette = app.palette()
+    palette.setColor(QPalette.ColorRole.Window, QColor(43, 43, 43))
+    app.setPalette(palette)
+    
     window = VideoDownloader()
     window.show()
     sys.exit(app.exec())
