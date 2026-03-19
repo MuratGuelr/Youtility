@@ -11,8 +11,8 @@ A **modern and powerful** application that allows you to download videos, playli
 | [![Screenshot](img/1.jpg)](img/1.jpg) | [![Screenshot](img/2.jpg)](img/2.jpg) |
 | ------------------------------------- | ------------------------------------- |
 | [![Screenshot](img/3.jpg)](img/3.jpg) | [![Screenshot](img/4.jpg)](img/4.jpg) |
-
----
+|                                       |                                       |
+| [![Screenshot](img/5.jpg)](img/5.jpg) | [![Screenshot](img/6.jpg)](img/6.jpg) |
 
 ## 📌 Features
 
