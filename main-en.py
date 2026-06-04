@@ -83,20 +83,24 @@ class PlaylistInfoThread(QThread):
     info_ready = pyqtSignal(dict)
     error      = pyqtSignal(str)
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, max_items: int = None):
         super().__init__()
         # If URL is a watch URL with list= param, convert to playlist URL
         # so yt-dlp doesn't get confused and return just the single video
         self.url = self._to_playlist_url(url)
+        self.max_items = max_items
 
     @staticmethod
     def _to_playlist_url(url: str) -> str:
-        """Convert https://youtube.com/watch?v=X&list=Y  →  https://youtube.com/playlist?list=Y"""
+        """Convert https://youtube.com/watch?v=X&list=Y  →  https://youtube.com/playlist?list=Y
+        Note: We do not convert YouTube Mixes (list starting with RD) because they
+        do not have a standalone playlist page and can only be extracted from the watch page.
+        """
         import urllib.parse
         parsed = urllib.parse.urlparse(url)
         params = urllib.parse.parse_qs(parsed.query)
         list_id = params.get("list", [None])[0]
-        if list_id and ("watch" in parsed.path or "v" in params):
+        if list_id and not list_id.startswith("RD") and ("watch" in parsed.path or "v" in params):
             return f"https://www.youtube.com/playlist?list={list_id}"
         return url
 
@@ -108,6 +112,9 @@ class PlaylistInfoThread(QThread):
                 "extract_flat": True,
                 "noplaylist":   False,
             }
+            if self.max_items:
+                opts["playlistend"] = self.max_items
+
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(self.url, download=False)
 
@@ -1935,6 +1942,24 @@ class VideoDownloader(QMainWindow):
         input_row.addWidget(self.pl_paste_btn)
         src_lyt.addLayout(input_row)
 
+        # ─── MAX ITEMS SELECTOR ───
+        options_row = QHBoxLayout()
+        options_row.setSpacing(10)
+        options_row.setContentsMargins(5, 0, 0, 0)
+        
+        max_lbl = QLabel("Max items to fetch:")
+        max_lbl.setStyleSheet("color:#e0e0e0; font-size:13px; font-weight:bold;")
+        
+        self.pl_max_items_combo = QComboBox()
+        self.pl_max_items_combo.addItems(["All", "10", "25", "50", "100", "200", "500"])
+        self.pl_max_items_combo.setStyleSheet(_COMBO)
+        self.pl_max_items_combo.setFixedWidth(100)
+        
+        options_row.addWidget(max_lbl)
+        options_row.addWidget(self.pl_max_items_combo)
+        options_row.addStretch()
+        src_lyt.addLayout(options_row)
+
         self.pl_info_label = QLabel("Waiting for playlist URL...")
         self.pl_info_label.setStyleSheet("color:#9e9e9e; font-size:13px; font-style:italic; padding-left:5px;")
         src_lyt.addWidget(self.pl_info_label)
@@ -2088,13 +2113,33 @@ class VideoDownloader(QMainWindow):
         if not url:
             return
 
+        # If it's a YouTube Mix (starts with RD), set the default to 50 if currently "All"
+        import urllib.parse
+        try:
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+            list_id = params.get("list", [None])[0]
+            if list_id and list_id.startswith("RD") and self.pl_max_items_combo.currentText() == "All":
+                self.pl_max_items_combo.setCurrentText("50")
+        except Exception:
+            pass
+
         self.pl_paste_btn.setEnabled(False)
         self.pl_paste_btn.setText("Fetching...")
         self.pl_info_label.setText("Fetching playlist info...")
         self.pl_table.setRowCount(0)
         self._playlist_entries =[]
 
-        self._playlist_info_thread = PlaylistInfoThread(url)
+        # Get maximum items limit
+        max_val = self.pl_max_items_combo.currentText()
+        max_items = None
+        if max_val != "All":
+            try:
+                max_items = int(max_val)
+            except ValueError:
+                pass
+
+        self._playlist_info_thread = PlaylistInfoThread(url, max_items=max_items)
         self._playlist_info_thread.info_ready.connect(self.on_playlist_info_ready)
         self._playlist_info_thread.error.connect(self.on_playlist_info_error)
         self._playlist_info_thread.start()

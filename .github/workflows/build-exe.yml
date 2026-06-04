@@ -1,0 +1,55 @@
+name: Build and Release Youtility EXE
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --noconsole --onefile --hidden-import=yt_dlp --hidden-import=yt_dlp.extractor --hidden-import=yt_dlp.extractor.youtube --hidden-import=yt_dlp.utils --hidden-import=yt_dlp.networking --hidden-import=yt_dlp.networking.impersonate --hidden-import=websockets --hidden-import=certifi --hidden-import=urllib3 --hidden-import=requests --hidden-import=PyQt6 --hidden-import=PyQt6.QtCore --hidden-import=PyQt6.QtWidgets --hidden-import=PyQt6.QtGui --collect-all yt_dlp --name "Youtility" --icon=icon.ico --add-data "icon.ico;." --windowed main-en.py
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Youtility-Windows
+          path: dist/Youtility.exe
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Youtility.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
