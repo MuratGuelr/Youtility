@@ -20,11 +20,80 @@ import subprocess
 import sqlite3
 import threading
 import urllib.parse
+import zipfile
 from collections import deque
 from datetime import datetime, timedelta
 
 import requests
 import yt_dlp
+
+
+# ─────────────────────────────────────────────────────────
+#  yt-dlp Binary Management Helpers
+# ─────────────────────────────────────────────────────────
+
+def _get_ytdlp_app_dir() -> str:
+    """Return %APPDATA%/Youtility  (or platform equivalent)."""
+    if os.name == "nt":
+        base = os.path.join(os.environ.get("APPDATA", "~"), "Youtility")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support/Youtility")
+    else:
+        base = os.path.expanduser("~/.config/youtility")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _get_ytdlp_bin_dir() -> str:
+    """Return directory for the external yt-dlp binary."""
+    d = os.path.join(_get_ytdlp_app_dir(), "bin")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _get_ytdlp_exe_path() -> str:
+    """Return path to the external yt-dlp.exe (may not exist yet)."""
+    return os.path.join(_get_ytdlp_bin_dir(), "yt-dlp.exe")
+
+
+def _has_external_ytdlp() -> bool:
+    """True when the user has downloaded the standalone yt-dlp.exe."""
+    return os.path.isfile(_get_ytdlp_exe_path())
+
+
+def _get_ytdlp_command() -> list:
+    """Return the command list to invoke yt-dlp.
+
+    • If a standalone yt-dlp.exe exists → ['path/yt-dlp.exe']
+    • Otherwise                         → [sys.executable, '-m', 'yt_dlp']
+    """
+    exe = _get_ytdlp_exe_path()
+    if os.path.isfile(exe):
+        return [exe]
+    return [sys.executable, "-m", "yt_dlp"]
+
+
+def _get_ytdlp_version() -> str:
+    """Get the version string of the active yt-dlp (external or bundled)."""
+    if _has_external_ytdlp():
+        try:
+            kwargs = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            out = subprocess.run(
+                [_get_ytdlp_exe_path(), "--version"],
+                capture_output=True, encoding="utf-8", errors="replace",
+                timeout=10, **kwargs,
+            ).stdout.strip()
+            if out:
+                return out
+        except Exception:
+            pass
+    # Fallback to bundled module version
+    return yt_dlp.version.__version__
+
+
+YTDLP_RELEASES_API = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget,
@@ -70,10 +139,30 @@ class InfoFetchThread(QThread):
 
     def run(self):
         try:
-            opts = {"quiet": True, "no_warnings": True}
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(self.url, download=False)
-            self.info_ready.emit(info)
+            if _has_external_ytdlp():
+                # Use external yt-dlp.exe for up-to-date extractors
+                cmd = _get_ytdlp_command() + [
+                    "--dump-json", "--no-download",
+                    "--quiet", "--no-warnings",
+                    self.url,
+                ]
+                kwargs = {}
+                if os.name == "nt":
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                result = subprocess.run(
+                    cmd, capture_output=True, encoding="utf-8",
+                    errors="replace", timeout=60, **kwargs,
+                )
+                if result.returncode != 0:
+                    raise Exception(result.stderr.strip() or f"yt-dlp exited with code {result.returncode}")
+                info = json.loads(result.stdout.strip())
+                self.info_ready.emit(info)
+            else:
+                # Fallback: bundled yt_dlp Python module
+                opts = {"quiet": True, "no_warnings": True}
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(self.url, download=False)
+                self.info_ready.emit(info)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -106,23 +195,154 @@ class PlaylistInfoThread(QThread):
 
     def run(self):
         try:
-            opts = {
-                "quiet":        True,
-                "no_warnings":  True,
-                "extract_flat": True,
-                "noplaylist":   False,
-            }
-            if self.max_items:
-                opts["playlistend"] = self.max_items
+            if _has_external_ytdlp():
+                # Use external yt-dlp.exe for up-to-date extractors
+                cmd = _get_ytdlp_command() + [
+                    "--flat-playlist", "--dump-json",
+                    "--no-download", "--quiet", "--no-warnings",
+                    "--no-playlist" if False else "--yes-playlist",
+                ]
+                if self.max_items:
+                    cmd += ["--playlist-end", str(self.max_items)]
+                cmd.append(self.url)
 
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(self.url, download=False)
+                kwargs = {}
+                if os.name == "nt":
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                result = subprocess.run(
+                    cmd, capture_output=True, encoding="utf-8",
+                    errors="replace", timeout=120, **kwargs,
+                )
+                if result.returncode != 0:
+                    raise Exception(result.stderr.strip() or f"yt-dlp exited with code {result.returncode}")
 
-            # Force-expand entries (may be a lazy generator in yt-dlp)
-            if info and "entries" in info:
-                info["entries"] = list(info["entries"] or [])
+                # --flat-playlist --dump-json produces one JSON line per entry
+                lines = [l for l in result.stdout.strip().splitlines() if l.strip()]
+                entries = []
+                playlist_info = {}
+                for line in lines:
+                    try:
+                        obj = json.loads(line)
+                        if obj.get("_type") == "playlist" or "entries" in obj:
+                            playlist_info = obj
+                        else:
+                            entries.append(obj)
+                    except json.JSONDecodeError:
+                        continue
 
-            self.info_ready.emit(info)
+                if playlist_info:
+                    if entries and "entries" not in playlist_info:
+                        playlist_info["entries"] = entries
+                    self.info_ready.emit(playlist_info)
+                elif entries:
+                    # Build a synthetic playlist dict
+                    self.info_ready.emit({
+                        "_type": "playlist",
+                        "title": entries[0].get("playlist_title", "Playlist"),
+                        "entries": entries,
+                        "playlist_count": len(entries),
+                    })
+                else:
+                    raise Exception("No playlist data returned")
+            else:
+                # Fallback: bundled yt_dlp Python module
+                opts = {
+                    "quiet":        True,
+                    "no_warnings":  True,
+                    "extract_flat": True,
+                    "noplaylist":   False,
+                }
+                if self.max_items:
+                    opts["playlistend"] = self.max_items
+
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(self.url, download=False)
+
+                # Force-expand entries (may be a lazy generator in yt-dlp)
+                if info and "entries" in info:
+                    info["entries"] = list(info["entries"] or [])
+
+                self.info_ready.emit(info)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class YtDlpVersionCheckThread(QThread):
+    """Check GitHub for the latest yt-dlp release tag (non-blocking)."""
+    result = pyqtSignal(str, str)   # (current_version, latest_version)
+    error  = pyqtSignal(str)
+
+    def run(self):
+        try:
+            current = _get_ytdlp_version()
+            resp = requests.get(YTDLP_RELEASES_API, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            latest = data.get("tag_name", "").strip()
+            self.result.emit(current, latest)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class YtDlpUpdateThread(QThread):
+    """Download the latest yt-dlp.exe from GitHub releases."""
+    progress = pyqtSignal(int)       # 0-100 percent
+    finished = pyqtSignal(str)       # new version string
+    error    = pyqtSignal(str)
+
+    def __init__(self, target_tag: str = ""):
+        super().__init__()
+        self.target_tag = target_tag  # e.g. "2026.08.19"
+
+    def run(self):
+        try:
+            # 1. Get release info
+            self.progress.emit(5)
+            resp = requests.get(YTDLP_RELEASES_API, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            tag = data.get("tag_name", "").strip()
+
+            # 2. Find yt-dlp.exe asset
+            exe_url = None
+            for asset in data.get("assets", []):
+                if asset.get("name") == "yt-dlp.exe":
+                    exe_url = asset["browser_download_url"]
+                    break
+
+            if not exe_url:
+                self.error.emit("Could not find yt-dlp.exe in the latest release assets.")
+                return
+
+            # 3. Download with progress
+            self.progress.emit(10)
+            dl_resp = requests.get(exe_url, stream=True, timeout=60)
+            dl_resp.raise_for_status()
+
+            total = int(dl_resp.headers.get("content-length", 0))
+            dest = _get_ytdlp_exe_path()
+            tmp = dest + ".tmp"
+
+            downloaded = 0
+            with open(tmp, "wb") as f:
+                for chunk in dl_resp.iter_content(chunk_size=65536):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        pct = 10 + int(85 * downloaded / total)
+                        self.progress.emit(min(pct, 95))
+
+            # 4. Replace old exe atomically
+            if os.path.exists(dest):
+                try:
+                    os.remove(dest)
+                except Exception:
+                    pass
+            os.rename(tmp, dest)
+
+            self.progress.emit(100)
+            self.finished.emit(tag)
+
         except Exception as e:
             self.error.emit(str(e))
 
@@ -134,6 +354,17 @@ class DownloadThread(QThread):
     error_signal    = pyqtSignal(str)
     finished_signal = pyqtSignal(str)   # emits FINAL merged file path
 
+    # Regex for yt-dlp progress lines (--newline mode)
+    _PROG_RE = re.compile(
+        r"\[download\]\s+([\d.]+)%\s+of\s+~?([\d.]+)(KiB|MiB|GiB|B)"
+        r"\s+at\s+([\d.]+)(KiB|MiB|GiB|B)/s"
+        r"(?:\s+ETA\s+([\d:]+))?",
+        re.IGNORECASE,
+    )
+    _MERGE_RE = re.compile(r"\[ffmpeg\]|Merging|\[Merger\]|\[Remux\]", re.IGNORECASE)
+    _DEST_RE  = re.compile(r"\[download\]\s+Destination:\s+(.+)")
+    _MERGE_DEST_RE = re.compile(r"\[(?:Merger|Remux|ffmpeg)\]\s+Merging formats into \"(.+)\"")
+
     def __init__(self, url: str, download_path: str, ydl_opts: dict):
         super().__init__()
         self.url              = url
@@ -143,8 +374,162 @@ class DownloadThread(QThread):
         self.downloaded_file  = None   # last intermediate file seen
         self.final_file       = None   # final path after postprocessing/merge
         self.current_ydl      = None
+        self._proc            = None   # subprocess handle for external exe
+
+    @staticmethod
+    def _to_bytes(value: float, unit: str) -> float:
+        return value * {"B": 1, "KIB": 1024, "MIB": 1024**2, "GIB": 1024**3}.get(unit.upper(), 1)
+
+    def _build_cli_args(self) -> list:
+        """Convert ydl_opts dict to yt-dlp CLI arguments."""
+        args = []
+        opts = self.ydl_opts
+
+        if opts.get("format"):
+            args += ["-f", opts["format"]]
+        if opts.get("outtmpl"):
+            args += ["-o", opts["outtmpl"]]
+        if opts.get("merge_output_format"):
+            args += ["--merge-output-format", opts["merge_output_format"]]
+        if opts.get("quiet"):
+            args.append("--quiet")
+        if opts.get("no_warnings"):
+            args.append("--no-warnings")
+        if opts.get("keepvideo"):
+            args.append("--keep-video")
+        if opts.get("concurrent_fragment_downloads"):
+            args += ["--concurrent-fragments", str(opts["concurrent_fragment_downloads"])]
+        if opts.get("force_keyframes_at_cuts"):
+            args.append("--force-keyframes-at-cuts")
+        if opts.get("noplaylist"):
+            args.append("--no-playlist")
+
+        # download_ranges cannot be easily serialized; use --download-sections instead
+        # (handled at call site if needed)
+
+        # Always add --newline for line-based progress parsing and --progress
+        # Remove --quiet so we can see progress
+        if "--quiet" in args:
+            args.remove("--quiet")
+        args += ["--newline", "--progress"]
+
+        return args
 
     def run(self):
+        if _has_external_ytdlp():
+            self._run_subprocess()
+        else:
+            self._run_python_api()
+
+    def _run_subprocess(self):
+        """Download using external yt-dlp.exe subprocess."""
+        try:
+            cmd = _get_ytdlp_command() + self._build_cli_args() + [self.url]
+
+            kwargs = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                **kwargs,
+            )
+
+            last_dest = ""
+            merge_dest = ""
+
+            for line in self._proc.stdout:
+                if self.is_cancelled:
+                    break
+                line = line.rstrip()
+
+                # Capture destination file
+                dm = self._DEST_RE.match(line)
+                if dm:
+                    last_dest = dm.group(1).strip()
+                    self.downloaded_file = last_dest
+                    continue
+
+                # Capture merge destination
+                mm = self._MERGE_DEST_RE.match(line)
+                if mm:
+                    merge_dest = mm.group(1).strip()
+                    self.final_file = merge_dest
+                    continue
+
+                # Merging status
+                if self._MERGE_RE.search(line):
+                    self.status_signal.emit("merging")
+                    continue
+
+                # Progress line
+                pm = self._PROG_RE.search(line)
+                if pm:
+                    pct = float(pm.group(1))
+                    total_val = float(pm.group(2))
+                    total_unit = pm.group(3)
+                    spd_val = float(pm.group(4))
+                    spd_unit = pm.group(5)
+                    eta_str = pm.group(6) or ""
+
+                    total_bytes = self._to_bytes(total_val, total_unit)
+                    speed_bytes = self._to_bytes(spd_val, spd_unit)
+                    done_bytes = total_bytes * (pct / 100.0)
+
+                    eta_secs = 0
+                    if eta_str:
+                        parts = eta_str.split(":")
+                        try:
+                            if len(parts) == 3:
+                                eta_secs = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                            elif len(parts) == 2:
+                                eta_secs = int(parts[0]) * 60 + int(parts[1])
+                            else:
+                                eta_secs = int(parts[0])
+                        except Exception:
+                            pass
+
+                    self.progress_signal.emit({
+                        "status": "downloading",
+                        "_percent_str": f"{pct:.1f}%",
+                        "_total_bytes_str": f"{total_val:.1f}{total_unit}",
+                        "_speed_str": f"{spd_val:.1f}{spd_unit}/s",
+                        "_eta_str": eta_str,
+                        "downloaded_bytes": done_bytes,
+                        "total_bytes": total_bytes,
+                        "speed": speed_bytes,
+                        "eta": eta_secs,
+                    })
+
+            ret = self._proc.wait()
+            if self.is_cancelled:
+                return
+
+            if ret != 0:
+                self.error_signal.emit(f"yt-dlp exited with code {ret}")
+                return
+
+            # Determine final file path
+            best = self.final_file or self.downloaded_file or ""
+            if best and not os.path.exists(best):
+                # Try resolving merged file
+                best = self._resolve_merged(
+                    self.downloaded_file,
+                    self.ydl_opts.get("merge_output_format", ""),
+                ) or best
+            self.finished_signal.emit(best)
+
+        except Exception as e:
+            if not self.is_cancelled:
+                self.error_signal.emit(str(e))
+
+    def _run_python_api(self):
+        """Download using bundled yt_dlp Python module (fallback)."""
         try:
             def progress_hook(d):
                 if self.is_cancelled:
@@ -202,6 +587,11 @@ class DownloadThread(QThread):
     def cancel(self):
         """Signal cancellation. Do NOT wait() here — blocks the UI event loop."""
         self.is_cancelled = True
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
         if self.isRunning():
             self.terminate()
 
@@ -223,8 +613,132 @@ class PlaylistDownloadThread(QThread):
         self.is_cancelled  = False
         self.total         = len(entries)
         self.current_index = 0
+        self._proc         = None
+
+    def _get_video_url(self, entry, index):
+        """Resolve the video URL from a playlist entry."""
+        video_url = entry.get("webpage_url")
+        if not video_url:
+            raw = entry.get("url", "")
+            if raw.startswith("http"):
+                video_url = raw
+            elif raw:
+                video_url = f"https://www.youtube.com/watch?v={raw}"
+        return video_url
 
     def run(self):
+        if _has_external_ytdlp():
+            self._run_subprocess()
+        else:
+            self._run_python_api()
+
+    def _run_subprocess(self):
+        """Download each playlist video using external yt-dlp.exe subprocess."""
+        # Build a temporary DownloadThread just to reuse its _build_cli_args
+        tmp_dt = DownloadThread("", self.download_path, self.ydl_opts)
+        base_args = tmp_dt._build_cli_args()
+        # Ensure --no-playlist so each video is downloaded individually
+        if "--no-playlist" not in base_args:
+            base_args.append("--no-playlist")
+
+        for i, entry in enumerate(self.entries):
+            if self.is_cancelled:
+                break
+
+            self.current_index = i + 1
+            title = entry.get("title", f"Video {i + 1}")
+
+            video_url = self._get_video_url(entry, i)
+            if not video_url:
+                self.error_signal.emit(f"Could not get URL for video {i + 1}", i)
+                continue
+
+            self.video_started_signal.emit(self.current_index, title)
+
+            try:
+                cmd = _get_ytdlp_command() + base_args + [video_url]
+
+                kwargs = {}
+                if os.name == "nt":
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+                self._proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    **kwargs,
+                )
+
+                last_dest = ""
+                merge_dest = ""
+
+                for line in self._proc.stdout:
+                    if self.is_cancelled:
+                        break
+                    line = line.rstrip()
+
+                    dm = DownloadThread._DEST_RE.match(line)
+                    if dm:
+                        last_dest = dm.group(1).strip()
+                        continue
+
+                    mm = DownloadThread._MERGE_DEST_RE.match(line)
+                    if mm:
+                        merge_dest = mm.group(1).strip()
+                        continue
+
+                    pm = DownloadThread._PROG_RE.search(line)
+                    if pm:
+                        pct = float(pm.group(1))
+                        total_val = float(pm.group(2))
+                        total_unit = pm.group(3)
+                        spd_val = float(pm.group(4))
+                        spd_unit = pm.group(5)
+                        eta_str = pm.group(6) or ""
+
+                        total_bytes = DownloadThread._to_bytes(total_val, total_unit)
+                        speed_bytes = DownloadThread._to_bytes(spd_val, spd_unit)
+                        done_bytes = total_bytes * (pct / 100.0)
+
+                        self.progress_signal.emit({
+                            "status": "downloading",
+                            "_percent_str": f"{pct:.1f}%",
+                            "_total_bytes_str": f"{total_val:.1f}{total_unit}",
+                            "_speed_str": f"{spd_val:.1f}{spd_unit}/s",
+                            "_eta_str": eta_str,
+                            "downloaded_bytes": done_bytes,
+                            "total_bytes": total_bytes,
+                            "speed": speed_bytes,
+                        })
+
+                ret = self._proc.wait()
+                if self.is_cancelled:
+                    break
+
+                best = merge_dest or last_dest or ""
+                if best and not os.path.exists(best):
+                    best = DownloadThread._resolve_merged(
+                        last_dest, self.ydl_opts.get("merge_output_format", "")
+                    ) or best
+
+                if ret != 0:
+                    self.error_signal.emit(f"yt-dlp exited with code {ret}", i)
+                else:
+                    self.video_done_signal.emit(self.current_index, best)
+
+            except Exception as e:
+                if self.is_cancelled:
+                    break
+                self.error_signal.emit(str(e), i)
+
+        if not self.is_cancelled:
+            self.all_done_signal.emit()
+
+    def _run_python_api(self):
+        """Download each playlist video using bundled yt_dlp Python module (fallback)."""
         current_file  = [None]
         final_file    = [None]
 
@@ -259,16 +773,7 @@ class PlaylistDownloadThread(QThread):
             self.current_index = i + 1
             title = entry.get("title", f"Video {i + 1}")
 
-            # extract_flat returns `url` which may be just a video ID or a short URL
-            video_url = entry.get("webpage_url")
-            if not video_url:
-                raw = entry.get("url", "")
-                if raw.startswith("http"):
-                    video_url = raw
-                elif raw:
-                    # Plain video ID — build full URL
-                    video_url = f"https://www.youtube.com/watch?v={raw}"
-
+            video_url = self._get_video_url(entry, i)
             if not video_url:
                 self.error_signal.emit(f"Could not get URL for video {i + 1}", i)
                 continue
@@ -297,6 +802,11 @@ class PlaylistDownloadThread(QThread):
     def cancel(self):
         """Signal cancellation. Do NOT wait() here — blocks the UI event loop."""
         self.is_cancelled = True
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
         if self.isRunning():
             self.terminate()
 
@@ -482,7 +992,7 @@ class LiveStreamThread(QThread):
         return f"{safe}.{ext}" if safe else f"recording.{ext}"
 
     def run(self):
-        cmd = [sys.executable, "-m", "yt_dlp"] + self.ydl_args + [self.url]
+        cmd = _get_ytdlp_command() + self.ydl_args + [self.url]
         final_path = ""
         video_title = ""
         video_id = ""
@@ -822,6 +1332,35 @@ class VideoDownloader(QMainWindow):
         self.init_ui()
         self.load_settings()
 
+        # ── Startup yt-dlp version check (delayed, non-blocking) ──
+        QTimer.singleShot(2000, self._startup_ytdlp_check)
+
+    def _startup_ytdlp_check(self):
+        """Background check for yt-dlp updates on app startup."""
+        self._startup_check_thread = YtDlpVersionCheckThread()
+        self._startup_check_thread.result.connect(self._on_startup_ytdlp_result)
+        self._startup_check_thread.start()
+
+    def _on_startup_ytdlp_result(self, current: str, latest: str):
+        """Show a non-intrusive notification if yt-dlp is outdated."""
+        if current < latest:
+            reply = QMessageBox.question(
+                self, "yt-dlp Update Available",
+                f"Your yt-dlp engine ({current}) is outdated.\n"
+                f"Latest version: {latest}\n\n"
+                "An outdated yt-dlp can cause download errors (HTTP 403).\n"
+                "Would you like to update now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                # Switch to Settings tab and trigger update
+                for i in range(self.tabs.count()):
+                    if "Settings" in self.tabs.tabText(i):
+                        self.tabs.setCurrentIndex(i)
+                        break
+                # Short delay to ensure UI is switched before triggering
+                QTimer.singleShot(300, self.start_ytdlp_update)
     # ── Global stylesheet ──────────────────────────────────
     def setup_ui_style(self):
         self.setStyleSheet("""
@@ -3804,7 +4343,67 @@ class VideoDownloader(QMainWindow):
         qc_lyt.addLayout(form_q)
         layout.addWidget(qual_card)
 
-        # 4. FFMPEG CARD
+        # 4. YT-DLP UPDATE CARD
+        ytdlp_card = QWidget()
+        ytdlp_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
+        yt_lyt = QVBoxLayout(ytdlp_card)
+        yt_lyt.setContentsMargins(15, 15, 15, 15)
+        yt_lyt.setSpacing(10)
+
+        yt_title = QLabel("🔄  yt-dlp Engine")
+        yt_title.setStyleSheet("color:#fff; font-size:14px; font-weight:bold; border:none;")
+        yt_lyt.addWidget(yt_title)
+
+        yt_desc = QLabel(
+            "yt-dlp is the engine that downloads videos. YouTube frequently changes "
+            "its API, so keeping yt-dlp up to date is essential to avoid download errors."
+        )
+        yt_desc.setWordWrap(True)
+        yt_desc.setStyleSheet("color:#999; font-size:12px; border:none;")
+        yt_lyt.addWidget(yt_desc)
+
+        self.ytdlp_version_label = QLabel("Checking yt-dlp version...")
+        self.ytdlp_version_label.setStyleSheet("color:#b0b0b0; font-size:13px; border:none;")
+        yt_lyt.addWidget(self.ytdlp_version_label)
+
+        self.ytdlp_latest_label = QLabel("")
+        self.ytdlp_latest_label.setStyleSheet("color:#b0b0b0; font-size:12px; border:none;")
+        self.ytdlp_latest_label.hide()
+        yt_lyt.addWidget(self.ytdlp_latest_label)
+
+        self.ytdlp_progress_bar = QProgressBar()
+        self.ytdlp_progress_bar.setRange(0, 100)
+        self.ytdlp_progress_bar.setValue(0)
+        self.ytdlp_progress_bar.setStyleSheet("""
+            QProgressBar { background:#1e1e1e; border:1px solid #444; border-radius:5px;
+                           text-align:center; color:#fff; height:20px; }
+            QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                  stop:0 #2196F3, stop:1 #42A5F5); border-radius:4px; }
+        """)
+        self.ytdlp_progress_bar.hide()
+        yt_lyt.addWidget(self.ytdlp_progress_bar)
+
+        yt_btn_row = QHBoxLayout()
+        self.ytdlp_check_button = QPushButton("🔍  Check for Updates")
+        self.ytdlp_check_button.setMinimumHeight(38)
+        self.ytdlp_check_button.setStyleSheet(_BTN_BLUE)
+        self.ytdlp_check_button.clicked.connect(self.check_ytdlp_update)
+        yt_btn_row.addWidget(self.ytdlp_check_button)
+
+        self.ytdlp_update_button = QPushButton("⬇  Update yt-dlp")
+        self.ytdlp_update_button.setMinimumHeight(38)
+        self.ytdlp_update_button.setStyleSheet(
+            _BTN_BLUE.replace("#2196F3", "#4CAF50").replace("#1976D2", "#388E3C")
+            .replace("#1565C0", "#2E7D32")
+        )
+        self.ytdlp_update_button.clicked.connect(self.start_ytdlp_update)
+        self.ytdlp_update_button.hide()
+        yt_btn_row.addWidget(self.ytdlp_update_button)
+        yt_lyt.addLayout(yt_btn_row)
+
+        layout.addWidget(ytdlp_card)
+
+        # 5. FFMPEG CARD
         ffmpeg_card = QWidget()
         ffmpeg_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
         ff_lyt = QVBoxLayout(ffmpeg_card)
@@ -3828,7 +4427,7 @@ class VideoDownloader(QMainWindow):
         ff_lyt.addWidget(self.ffmpeg_download_button)
         layout.addWidget(ffmpeg_card)
 
-        # 5. SAVE BUTTON
+        # 6. SAVE BUTTON
         save_btn = QPushButton("💾  Save Settings")
         save_btn.setMinimumHeight(45)
         save_btn.setStyleSheet(_BTN_BLUE + "font-size:14px;")
@@ -3838,118 +4437,7 @@ class VideoDownloader(QMainWindow):
         layout.addStretch()
 
         self.update_ffmpeg_status()
-
-        if self.settings_tab.layout():
-            QWidget().setLayout(self.settings_tab.layout())
-
-        layout = QVBoxLayout(self.settings_tab)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
-
-        # 1. HEADER
-        header = QWidget()
-        header.setStyleSheet("QWidget{background-color:#363636; border-radius:8px; padding:8px;}")
-        hdr_lyt = QHBoxLayout(header)
-        hdr_lyt.setContentsMargins(10, 0, 10, 0)
-        hdr_lyt.setSpacing(10)
-        ic = QLabel()
-        ic.setPixmap(QPixmap(get_resource_path("icon.ico")).scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        hdr_lyt.addWidget(ic)
-        hdr_lyt.addWidget(_make_label("App Settings", "color:#fff; font-size:16px; font-weight:bold;"))
-        hdr_lyt.addWidget(_make_label("Configure download folder and default qualities.", "color:#b0b0b0; font-size:12px;"), 1)
-        layout.addWidget(header)
-
-        # 2. DOWNLOAD FOLDER CARD
-        folder_card = QWidget()
-        folder_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
-        fc_lyt = QVBoxLayout(folder_card)
-        fc_lyt.setContentsMargins(15, 15, 15, 15)
-        fc_lyt.setSpacing(10)
-        
-        fc_title = QLabel("📥  Download Folder")
-        fc_title.setStyleSheet("color:#fff; font-size:14px; font-weight:bold; border:none;")
-        fc_lyt.addWidget(fc_title)
-
-        row_f = QHBoxLayout()
-        self.folder_input = QLineEdit()
-        self.folder_input.setPlaceholderText("Select a download folder...")
-        self.folder_input.setMinimumHeight(40)
-        self.folder_input.setStyleSheet(_INPUT)
-        
-        self.folder_browse_button = QPushButton("Browse")
-        self.folder_browse_button.setMinimumHeight(40)
-        self.folder_browse_button.setFixedWidth(120)
-        self.folder_browse_button.setStyleSheet(_BTN_BLUE)
-        self.folder_browse_button.clicked.connect(self.browse_download_folder)
-
-        row_f.addWidget(self.folder_input)
-        row_f.addWidget(self.folder_browse_button)
-        fc_lyt.addLayout(row_f)
-        layout.addWidget(folder_card)
-
-        # 3. DEFAULTS CARD
-        qual_card = QWidget()
-        qual_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
-        qc_lyt = QVBoxLayout(qual_card)
-        qc_lyt.setContentsMargins(15, 15, 15, 15)
-        qc_lyt.setSpacing(10)
-
-        qc_title = QLabel("⚙️  Default Quality Settings")
-        qc_title.setStyleSheet("color:#fff; font-size:14px; font-weight:bold; border:none;")
-        qc_lyt.addWidget(qc_title)
-
-        form_q = QFormLayout()
-        form_q.setSpacing(15)
-        self.video_quality_combo = QComboBox()
-        self.video_quality_combo.addItems(["Best", "1080p", "720p", "480p", "360p"])
-        self.video_quality_combo.setStyleSheet(_COMBO)
-        self.video_quality_combo.setFixedWidth(200)
-
-        self.audio_quality_combo = QComboBox()
-        self.audio_quality_combo.addItems(["Best", "320k", "256k", "192k", "128k", "96k"])
-        self.audio_quality_combo.setStyleSheet(_COMBO)
-        self.audio_quality_combo.setFixedWidth(200)
-
-        lbl_style = "color:#e0e0e0; font-size:13px; border:none;"
-        form_q.addRow(_make_label("🎥  Video Quality:", lbl_style), self.video_quality_combo)
-        form_q.addRow(_make_label("🔊  Audio Quality:", lbl_style), self.audio_quality_combo)
-        qc_lyt.addLayout(form_q)
-        layout.addWidget(qual_card)
-
-        # 4. FFMPEG CARD
-        ffmpeg_card = QWidget()
-        ffmpeg_card.setStyleSheet("background-color:#2a2a2a; border-radius:10px; border:1px solid #3d3d3d;")
-        ff_lyt = QVBoxLayout(ffmpeg_card)
-        ff_lyt.setContentsMargins(15, 15, 15, 15)
-        ff_lyt.setSpacing(10)
-
-        ff_title = QLabel("🎬  FFmpeg Status")
-        ff_title.setStyleSheet("color:#fff; font-size:14px; font-weight:bold; border:none;")
-        ff_lyt.addWidget(ff_title)
-
-        self.ffmpeg_status = QLabel("Checking FFmpeg status...")
-        self.ffmpeg_status.setStyleSheet("color:#b0b0b0; font-size:13px; border:none;")
-        ff_lyt.addWidget(self.ffmpeg_status)
-
-        self.ffmpeg_download_button = QPushButton("⬇ Download & Install FFmpeg")
-        self.ffmpeg_download_button.setMinimumHeight(38)
-        self.ffmpeg_download_button.setFixedWidth(250)
-        self.ffmpeg_download_button.setStyleSheet(_BTN_BLUE)
-        self.ffmpeg_download_button.clicked.connect(self.download_ffmpeg)
-        self.ffmpeg_download_button.hide()
-        ff_lyt.addWidget(self.ffmpeg_download_button)
-        layout.addWidget(ffmpeg_card)
-
-        # 5. SAVE BUTTON
-        save_btn = QPushButton("💾  Save Settings")
-        save_btn.setMinimumHeight(45)
-        save_btn.setStyleSheet(_BTN_BLUE + "font-size:14px;")
-        save_btn.clicked.connect(self.save_settings)
-        layout.addWidget(save_btn)
-        
-        layout.addStretch()
-
-        self.update_ffmpeg_status()
+        self.update_ytdlp_status()
 
     # ── Settings helpers ──────────────────────────────────
 
@@ -3966,7 +4454,6 @@ class VideoDownloader(QMainWindow):
         ffmpeg_path = shutil.which("ffmpeg")
         if ffmpeg_path:
             try:
-                # CMD penceresinin patlamasını engelleyen ayar
                 kwargs = {}
                 if os.name == "nt":
                     kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -3992,36 +4479,98 @@ class VideoDownloader(QMainWindow):
             self.ffmpeg_download_button.show()
             if hasattr(self, "ffmpeg_warning_banner"):
                 self.ffmpeg_warning_banner.show()
-        """Cross-platform FFmpeg detection via shutil.which."""
-        # FIXED: was using subprocess(['where', 'ffmpeg']) which only works on Windows
-        ffmpeg_path = shutil.which("ffmpeg")
-        if ffmpeg_path:
-            # Get version string
-            try:
-                ver_out = subprocess.run(
-                    ["ffmpeg", "-version"],
-                    capture_output=True, encoding='utf-8', errors='replace', timeout=5,
-                ).stdout
-                ver_match = re.search(r"ffmpeg version ([\w.-]+)", ver_out)
-                ver_str = ver_match.group(1) if ver_match else "unknown"
-            except Exception:
-                ver_str = "unknown"
 
-            self.ffmpeg_status.setText(f"✅  FFmpeg {ver_str} — installed and ready.")
-            self.ffmpeg_status.setStyleSheet(
-                "QLabel{color:#4caf50;font-size:13px;padding:5px;}"
-            )
-            self.ffmpeg_download_button.hide()
-            if hasattr(self, "ffmpeg_warning_banner"):
-                self.ffmpeg_warning_banner.hide()
+    # ── yt-dlp update helpers ─────────────────────────────
+
+    def update_ytdlp_status(self):
+        """Show current yt-dlp version on the settings card."""
+        ver = _get_ytdlp_version()
+        source = "standalone" if _has_external_ytdlp() else "bundled"
+        self.ytdlp_version_label.setText(f"📦  Current version: {ver} ({source})")
+        self.ytdlp_version_label.setStyleSheet("color:#b0b0b0; font-size:13px; border:none;")
+
+    def check_ytdlp_update(self):
+        """Check GitHub for yt-dlp updates (runs in background thread)."""
+        self.ytdlp_check_button.setEnabled(False)
+        self.ytdlp_check_button.setText("🔍  Checking...")
+        self.ytdlp_update_button.hide()
+        self.ytdlp_latest_label.hide()
+
+        self._ytdlp_check_thread = YtDlpVersionCheckThread()
+        self._ytdlp_check_thread.result.connect(self._on_ytdlp_version_check)
+        self._ytdlp_check_thread.error.connect(self._on_ytdlp_check_error)
+        self._ytdlp_check_thread.start()
+
+    def _on_ytdlp_version_check(self, current: str, latest: str):
+        """Called when version check completes."""
+        self.ytdlp_check_button.setEnabled(True)
+        self.ytdlp_check_button.setText("🔍  Check for Updates")
+
+        self._ytdlp_latest_tag = latest
+
+        if current >= latest:
+            self.ytdlp_version_label.setText(f"✅  yt-dlp {current} — up to date!")
+            self.ytdlp_version_label.setStyleSheet("QLabel{color:#4caf50;font-size:13px;padding:5px;border:none;}")
+            self.ytdlp_latest_label.hide()
+            self.ytdlp_update_button.hide()
         else:
-            self.ffmpeg_status.setText("❌  FFmpeg not found on this system.")
-            self.ffmpeg_status.setStyleSheet(
-                "QLabel{color:#f44336;font-size:13px;padding:5px;}"
-            )
-            self.ffmpeg_download_button.show()
-            if hasattr(self, "ffmpeg_warning_banner"):
-                self.ffmpeg_warning_banner.show()
+            self.ytdlp_version_label.setText(f"⚠️  yt-dlp {current} — update available!")
+            self.ytdlp_version_label.setStyleSheet("QLabel{color:#FF9800;font-size:13px;padding:5px;border:none;}")
+            self.ytdlp_latest_label.setText(f"Latest version: {latest}")
+            self.ytdlp_latest_label.setStyleSheet("color:#4CAF50; font-size:12px; border:none; padding-left:5px;")
+            self.ytdlp_latest_label.show()
+            self.ytdlp_update_button.show()
+
+    def _on_ytdlp_check_error(self, err: str):
+        """Called when version check fails."""
+        self.ytdlp_check_button.setEnabled(True)
+        self.ytdlp_check_button.setText("🔍  Check for Updates")
+        self.ytdlp_version_label.setText(f"❌  Could not check for updates: {err}")
+        self.ytdlp_version_label.setStyleSheet("QLabel{color:#f44336;font-size:13px;padding:5px;border:none;}")
+
+    def start_ytdlp_update(self):
+        """Download and install the latest yt-dlp.exe from GitHub."""
+        self.ytdlp_update_button.setEnabled(False)
+        self.ytdlp_update_button.setText("⬇  Downloading...")
+        self.ytdlp_check_button.setEnabled(False)
+        self.ytdlp_progress_bar.setValue(0)
+        self.ytdlp_progress_bar.show()
+
+        tag = getattr(self, "_ytdlp_latest_tag", "")
+        self._ytdlp_update_thread = YtDlpUpdateThread(tag)
+        self._ytdlp_update_thread.progress.connect(self._on_ytdlp_dl_progress)
+        self._ytdlp_update_thread.finished.connect(self._on_ytdlp_dl_finished)
+        self._ytdlp_update_thread.error.connect(self._on_ytdlp_dl_error)
+        self._ytdlp_update_thread.start()
+
+    def _on_ytdlp_dl_progress(self, pct: int):
+        self.ytdlp_progress_bar.setValue(pct)
+
+    def _on_ytdlp_dl_finished(self, new_ver: str):
+        self.ytdlp_progress_bar.setValue(100)
+        self.ytdlp_update_button.hide()
+        self.ytdlp_check_button.setEnabled(True)
+        self.ytdlp_check_button.setText("🔍  Check for Updates")
+        self.ytdlp_latest_label.hide()
+
+        self.ytdlp_version_label.setText(f"✅  yt-dlp {new_ver} — updated successfully!")
+        self.ytdlp_version_label.setStyleSheet("QLabel{color:#4caf50;font-size:13px;padding:5px;border:none;}")
+
+        QMessageBox.information(
+            self, "yt-dlp Updated",
+            f"yt-dlp has been updated to version {new_ver}.\n\n"
+            "You can now download videos without errors!"
+        )
+        # Hide progress bar after a short delay
+        QTimer.singleShot(2000, lambda: self.ytdlp_progress_bar.hide())
+
+    def _on_ytdlp_dl_error(self, err: str):
+        self.ytdlp_progress_bar.hide()
+        self.ytdlp_update_button.setEnabled(True)
+        self.ytdlp_update_button.setText("⬇  Update yt-dlp")
+        self.ytdlp_check_button.setEnabled(True)
+        self.ytdlp_check_button.setText("🔍  Check for Updates")
+        QMessageBox.warning(self, "Update Error", f"Failed to update yt-dlp:\n{err}")
 
     def download_ffmpeg(self):
         """Install FFmpeg via winget (Windows only)."""
