@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sqlite3
 import threading
+import time
 import urllib.parse
 import zipfile
 from collections import deque
@@ -77,13 +78,10 @@ def _get_ytdlp_version() -> str:
     """Get the version string of the active yt-dlp (external or bundled)."""
     if _has_external_ytdlp():
         try:
-            kwargs = {}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             out = subprocess.run(
                 [_get_ytdlp_exe_path(), "--version"],
                 capture_output=True, encoding="utf-8", errors="replace",
-                timeout=10, **kwargs,
+                timeout=10, creationflags=_NO_WINDOW,
             ).stdout.strip()
             if out:
                 return out
@@ -94,6 +92,162 @@ def _get_ytdlp_version() -> str:
 
 
 YTDLP_RELEASES_API = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+# Machine-readable progress: avoids fragile regex parsing of yt-dlp's human output
+# (which breaks on "Unknown B/s", "~" estimates, localized units, etc.).
+_PROGRESS_ARGS = [
+    "--newline", "--progress",
+    "--progress-template",
+    "download:[YTU]%(progress.downloaded_bytes)s|%(progress.total_bytes)s|"
+    "%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
+    "--print", "after_move:[YTU_FILE]%(filepath)s",
+]
+_RELIABILITY_ARGS = [
+    "--retries", "10", "--fragment-retries", "10",
+    "--socket-timeout", "20", "--no-mtime",
+]
+_FILE_PREFIX = "[YTU_FILE]"
+_PROGRESS_INTERVAL = 0.1   # seconds between UI progress emissions
+
+_js_runtime_args_cache = None
+
+
+def _js_runtime_args() -> list:
+    """yt-dlp only enables deno by default; point it at node/bun if that is what
+    the user has, otherwise YouTube extraction may miss formats."""
+    global _js_runtime_args_cache
+    if _js_runtime_args_cache is None:
+        _js_runtime_args_cache = []
+        if not shutil.which("deno"):
+            for name in ("node", "bun"):
+                if shutil.which(name):
+                    _js_runtime_args_cache = ["--js-runtimes", name]
+                    break
+    return _js_runtime_args_cache
+
+
+def _parse_progress_line(line: str):
+    """Parse a '[YTU]done|total|estimate|speed|eta' line into a progress dict."""
+    if not line.startswith("[YTU]"):
+        return None
+    parts = line[5:].split("|")
+    if len(parts) != 5:
+        return None
+
+    def num(s):
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    done, total, est, speed, eta = (num(p) for p in parts)
+    return {
+        "status": "downloading",
+        "downloaded_bytes": done or 0,
+        "total_bytes": total or est or 0,
+        "speed": speed or 0,
+        "eta": int(eta) if eta is not None else None,
+    }
+
+
+def _kill_process_tree(proc) -> None:
+    """Kill a subprocess and its children (ffmpeg etc.) without blocking."""
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, creationflags=_NO_WINDOW,
+            )
+        else:
+            proc.terminate()
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def _version_key(v: str) -> tuple:
+    """'2026.08.19.123' -> (2026, 8, 19, 123) for correct version ordering."""
+    return tuple(int(p) for p in re.findall(r"\d+", v or ""))
+
+
+def _build_ytdlp_args(opts: dict) -> list:
+    """Translate the ydl_opts dict used by the UI into yt-dlp CLI arguments."""
+    args = []
+    if opts.get("format"):
+        args += ["-f", opts["format"]]
+    if opts.get("outtmpl"):
+        args += ["-o", opts["outtmpl"]]
+    if opts.get("merge_output_format"):
+        args += ["--merge-output-format", opts["merge_output_format"]]
+    if opts.get("keepvideo"):
+        args.append("--keep-video")
+    if opts.get("concurrent_fragment_downloads"):
+        args += ["--concurrent-fragments", str(opts["concurrent_fragment_downloads"])]
+    if opts.get("restrictfilenames"):
+        args.append("--restrict-filenames")
+    if opts.get("windowsfilenames"):
+        args.append("--windows-filenames")
+    if opts.get("noplaylist"):
+        args.append("--no-playlist")
+    # download_ranges (callable) can't be serialized; the UI also passes the
+    # equivalent "*start-end" strings under _sections for the CLI path.
+    for section in opts.get("_sections", []):
+        args += ["--download-sections", section]
+    if opts.get("_sections") and opts.get("force_keyframes_at_cuts"):
+        args.append("--force-keyframes-at-cuts")
+    for pp in opts.get("postprocessors", []):
+        if pp.get("key") == "FFmpegExtractAudio":
+            args.append("--extract-audio")
+            if pp.get("preferredcodec"):
+                args += ["--audio-format", pp["preferredcodec"]]
+            if pp.get("preferredquality"):
+                args += ["--audio-quality", pp["preferredquality"]]
+    return (args + _PROGRESS_ARGS + _RELIABILITY_ARGS + _js_runtime_args()
+            + ["--no-warnings"])
+
+
+def _run_ytdlp_cli(thread, cmd: list, on_progress) -> tuple:
+    """Run yt-dlp, streaming throttled progress to on_progress(dict).
+
+    Returns (returncode, final_path, last_error_line).  `thread` must expose
+    `is_cancelled` and have `_proc` set by this function.
+    """
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    thread._proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        encoding="utf-8", errors="replace", bufsize=1, env=env,
+        creationflags=_NO_WINDOW,
+    )
+    final_path = ""
+    last_error = ""
+    last_emit = 0.0
+    for raw in thread._proc.stdout:
+        if thread.is_cancelled:
+            break
+        line = raw.strip()
+        if line.startswith(_FILE_PREFIX):
+            final_path = line[len(_FILE_PREFIX):].strip()
+            continue
+        prog = _parse_progress_line(line)
+        if prog:
+            now = time.monotonic()
+            finished = prog["total_bytes"] and prog["downloaded_bytes"] >= prog["total_bytes"]
+            if now - last_emit >= _PROGRESS_INTERVAL or finished:
+                last_emit = now
+                on_progress(prog)
+            continue
+        if line.startswith("ERROR"):
+            last_error = line
+    ret = thread._proc.wait()
+    return ret, final_path, last_error
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget,
@@ -142,16 +296,12 @@ class InfoFetchThread(QThread):
             if _has_external_ytdlp():
                 # Use external yt-dlp.exe for up-to-date extractors
                 cmd = _get_ytdlp_command() + [
-                    "--dump-json", "--no-download",
+                    "--dump-json", "--no-download", "--no-playlist",
                     "--quiet", "--no-warnings",
-                    self.url,
-                ]
-                kwargs = {}
-                if os.name == "nt":
-                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                ] + _js_runtime_args() + [self.url]
                 result = subprocess.run(
                     cmd, capture_output=True, encoding="utf-8",
-                    errors="replace", timeout=60, **kwargs,
+                    errors="replace", timeout=60, creationflags=_NO_WINDOW,
                 )
                 if result.returncode != 0:
                     raise Exception(result.stderr.strip() or f"yt-dlp exited with code {result.returncode}")
@@ -159,7 +309,7 @@ class InfoFetchThread(QThread):
                 self.info_ready.emit(info)
             else:
                 # Fallback: bundled yt_dlp Python module
-                opts = {"quiet": True, "no_warnings": True}
+                opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(self.url, download=False)
                 self.info_ready.emit(info)
@@ -200,18 +350,15 @@ class PlaylistInfoThread(QThread):
                 cmd = _get_ytdlp_command() + [
                     "--flat-playlist", "--dump-json",
                     "--no-download", "--quiet", "--no-warnings",
-                    "--no-playlist" if False else "--yes-playlist",
-                ]
+                    "--yes-playlist",
+                ] + _js_runtime_args()
                 if self.max_items:
                     cmd += ["--playlist-end", str(self.max_items)]
                 cmd.append(self.url)
 
-                kwargs = {}
-                if os.name == "nt":
-                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
                 result = subprocess.run(
                     cmd, capture_output=True, encoding="utf-8",
-                    errors="replace", timeout=120, **kwargs,
+                    errors="replace", timeout=120, creationflags=_NO_WINDOW,
                 )
                 if result.returncode != 0:
                     raise Exception(result.stderr.strip() or f"yt-dlp exited with code {result.returncode}")
@@ -325,7 +472,7 @@ class YtDlpUpdateThread(QThread):
 
             downloaded = 0
             with open(tmp, "wb") as f:
-                for chunk in dl_resp.iter_content(chunk_size=65536):
+                for chunk in dl_resp.iter_content(chunk_size=262144):
                     f.write(chunk)
                     downloaded += len(chunk)
                     if total > 0:
@@ -333,12 +480,7 @@ class YtDlpUpdateThread(QThread):
                         self.progress.emit(min(pct, 95))
 
             # 4. Replace old exe atomically
-            if os.path.exists(dest):
-                try:
-                    os.remove(dest)
-                except Exception:
-                    pass
-            os.rename(tmp, dest)
+            os.replace(tmp, dest)
 
             self.progress.emit(100)
             self.finished.emit(tag)
@@ -354,17 +496,6 @@ class DownloadThread(QThread):
     error_signal    = pyqtSignal(str)
     finished_signal = pyqtSignal(str)   # emits FINAL merged file path
 
-    # Regex for yt-dlp progress lines (--newline mode)
-    _PROG_RE = re.compile(
-        r"\[download\]\s+([\d.]+)%\s+of\s+~?([\d.]+)(KiB|MiB|GiB|B)"
-        r"\s+at\s+([\d.]+)(KiB|MiB|GiB|B)/s"
-        r"(?:\s+ETA\s+([\d:]+))?",
-        re.IGNORECASE,
-    )
-    _MERGE_RE = re.compile(r"\[ffmpeg\]|Merging|\[Merger\]|\[Remux\]", re.IGNORECASE)
-    _DEST_RE  = re.compile(r"\[download\]\s+Destination:\s+(.+)")
-    _MERGE_DEST_RE = re.compile(r"\[(?:Merger|Remux|ffmpeg)\]\s+Merging formats into \"(.+)\"")
-
     def __init__(self, url: str, download_path: str, ydl_opts: dict):
         super().__init__()
         self.url              = url
@@ -375,45 +506,11 @@ class DownloadThread(QThread):
         self.final_file       = None   # final path after postprocessing/merge
         self.current_ydl      = None
         self._proc            = None   # subprocess handle for external exe
-
-    @staticmethod
-    def _to_bytes(value: float, unit: str) -> float:
-        return value * {"B": 1, "KIB": 1024, "MIB": 1024**2, "GIB": 1024**3}.get(unit.upper(), 1)
+        self.started_at       = time.time()
 
     def _build_cli_args(self) -> list:
         """Convert ydl_opts dict to yt-dlp CLI arguments."""
-        args = []
-        opts = self.ydl_opts
-
-        if opts.get("format"):
-            args += ["-f", opts["format"]]
-        if opts.get("outtmpl"):
-            args += ["-o", opts["outtmpl"]]
-        if opts.get("merge_output_format"):
-            args += ["--merge-output-format", opts["merge_output_format"]]
-        if opts.get("quiet"):
-            args.append("--quiet")
-        if opts.get("no_warnings"):
-            args.append("--no-warnings")
-        if opts.get("keepvideo"):
-            args.append("--keep-video")
-        if opts.get("concurrent_fragment_downloads"):
-            args += ["--concurrent-fragments", str(opts["concurrent_fragment_downloads"])]
-        if opts.get("force_keyframes_at_cuts"):
-            args.append("--force-keyframes-at-cuts")
-        if opts.get("noplaylist"):
-            args.append("--no-playlist")
-
-        # download_ranges cannot be easily serialized; use --download-sections instead
-        # (handled at call site if needed)
-
-        # Always add --newline for line-based progress parsing and --progress
-        # Remove --quiet so we can see progress
-        if "--quiet" in args:
-            args.remove("--quiet")
-        args += ["--newline", "--progress"]
-
-        return args
+        return _build_ytdlp_args(self.ydl_opts)
 
     def run(self):
         if _has_external_ytdlp():
@@ -424,105 +521,26 @@ class DownloadThread(QThread):
     def _run_subprocess(self):
         """Download using external yt-dlp.exe subprocess."""
         try:
-            cmd = _get_ytdlp_command() + self._build_cli_args() + [self.url]
+            cmd = _get_ytdlp_command() + self._build_cli_args() + ["--no-playlist", self.url]
+            def on_progress(d):
+                self.progress_signal.emit(d)
+                total = d["total_bytes"]
+                if total and d["downloaded_bytes"] >= total:
+                    self.status_signal.emit("merging")   # stream done → post-processing
 
-            kwargs = {}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            ret, path, err = _run_ytdlp_cli(self, cmd, on_progress)
 
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                **kwargs,
-            )
-
-            last_dest = ""
-            merge_dest = ""
-
-            for line in self._proc.stdout:
-                if self.is_cancelled:
-                    break
-                line = line.rstrip()
-
-                # Capture destination file
-                dm = self._DEST_RE.match(line)
-                if dm:
-                    last_dest = dm.group(1).strip()
-                    self.downloaded_file = last_dest
-                    continue
-
-                # Capture merge destination
-                mm = self._MERGE_DEST_RE.match(line)
-                if mm:
-                    merge_dest = mm.group(1).strip()
-                    self.final_file = merge_dest
-                    continue
-
-                # Merging status
-                if self._MERGE_RE.search(line):
-                    self.status_signal.emit("merging")
-                    continue
-
-                # Progress line
-                pm = self._PROG_RE.search(line)
-                if pm:
-                    pct = float(pm.group(1))
-                    total_val = float(pm.group(2))
-                    total_unit = pm.group(3)
-                    spd_val = float(pm.group(4))
-                    spd_unit = pm.group(5)
-                    eta_str = pm.group(6) or ""
-
-                    total_bytes = self._to_bytes(total_val, total_unit)
-                    speed_bytes = self._to_bytes(spd_val, spd_unit)
-                    done_bytes = total_bytes * (pct / 100.0)
-
-                    eta_secs = 0
-                    if eta_str:
-                        parts = eta_str.split(":")
-                        try:
-                            if len(parts) == 3:
-                                eta_secs = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-                            elif len(parts) == 2:
-                                eta_secs = int(parts[0]) * 60 + int(parts[1])
-                            else:
-                                eta_secs = int(parts[0])
-                        except Exception:
-                            pass
-
-                    self.progress_signal.emit({
-                        "status": "downloading",
-                        "_percent_str": f"{pct:.1f}%",
-                        "_total_bytes_str": f"{total_val:.1f}{total_unit}",
-                        "_speed_str": f"{spd_val:.1f}{spd_unit}/s",
-                        "_eta_str": eta_str,
-                        "downloaded_bytes": done_bytes,
-                        "total_bytes": total_bytes,
-                        "speed": speed_bytes,
-                        "eta": eta_secs,
-                    })
-
-            ret = self._proc.wait()
             if self.is_cancelled:
                 return
-
             if ret != 0:
-                self.error_signal.emit(f"yt-dlp exited with code {ret}")
+                self.error_signal.emit(err or f"yt-dlp exited with code {ret}")
                 return
 
-            # Determine final file path
-            best = self.final_file or self.downloaded_file or ""
-            if best and not os.path.exists(best):
-                # Try resolving merged file
-                best = self._resolve_merged(
-                    self.downloaded_file,
-                    self.ydl_opts.get("merge_output_format", ""),
-                ) or best
-            self.finished_signal.emit(best)
+            self.final_file = path
+            if path and not os.path.exists(path):
+                path = self._resolve_merged(
+                    path, self.ydl_opts.get("merge_output_format", "")) or path
+            self.finished_signal.emit(path)
 
         except Exception as e:
             if not self.is_cancelled:
@@ -531,11 +549,16 @@ class DownloadThread(QThread):
     def _run_python_api(self):
         """Download using bundled yt_dlp Python module (fallback)."""
         try:
+            last_emit = [0.0]
+
             def progress_hook(d):
                 if self.is_cancelled:
                     raise Exception("Download cancelled by user.")
                 if d["status"] == "downloading":
-                    self.progress_signal.emit(d)
+                    now = time.monotonic()
+                    if now - last_emit[0] >= _PROGRESS_INTERVAL:
+                        last_emit[0] = now
+                        self.progress_signal.emit(d)
                 elif d["status"] == "finished":
                     self.downloaded_file = d["filename"]
 
@@ -550,6 +573,7 @@ class DownloadThread(QThread):
 
             self.ydl_opts["progress_hooks"]      = [progress_hook]
             self.ydl_opts["postprocessor_hooks"] = [postprocessor_hook]
+            self.ydl_opts["noplaylist"]          = True
 
             with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
                 self.current_ydl = ydl
@@ -585,15 +609,10 @@ class DownloadThread(QThread):
         return downloaded
 
     def cancel(self):
-        """Signal cancellation. Do NOT wait() here — blocks the UI event loop."""
+        """Signal cancellation. Never blocks and never terminates the thread
+        (QThread.terminate() can corrupt interpreter state)."""
         self.is_cancelled = True
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
-        if self.isRunning():
-            self.terminate()
+        _kill_process_tree(self._proc)
 
 
 class PlaylistDownloadThread(QThread):
@@ -634,10 +653,7 @@ class PlaylistDownloadThread(QThread):
 
     def _run_subprocess(self):
         """Download each playlist video using external yt-dlp.exe subprocess."""
-        # Build a temporary DownloadThread just to reuse its _build_cli_args
-        tmp_dt = DownloadThread("", self.download_path, self.ydl_opts)
-        base_args = tmp_dt._build_cli_args()
-        # Ensure --no-playlist so each video is downloaded individually
+        base_args = _build_ytdlp_args(self.ydl_opts)
         if "--no-playlist" not in base_args:
             base_args.append("--no-playlist")
 
@@ -657,77 +673,14 @@ class PlaylistDownloadThread(QThread):
 
             try:
                 cmd = _get_ytdlp_command() + base_args + [video_url]
-
-                kwargs = {}
-                if os.name == "nt":
-                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-                self._proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    **kwargs,
-                )
-
-                last_dest = ""
-                merge_dest = ""
-
-                for line in self._proc.stdout:
-                    if self.is_cancelled:
-                        break
-                    line = line.rstrip()
-
-                    dm = DownloadThread._DEST_RE.match(line)
-                    if dm:
-                        last_dest = dm.group(1).strip()
-                        continue
-
-                    mm = DownloadThread._MERGE_DEST_RE.match(line)
-                    if mm:
-                        merge_dest = mm.group(1).strip()
-                        continue
-
-                    pm = DownloadThread._PROG_RE.search(line)
-                    if pm:
-                        pct = float(pm.group(1))
-                        total_val = float(pm.group(2))
-                        total_unit = pm.group(3)
-                        spd_val = float(pm.group(4))
-                        spd_unit = pm.group(5)
-                        eta_str = pm.group(6) or ""
-
-                        total_bytes = DownloadThread._to_bytes(total_val, total_unit)
-                        speed_bytes = DownloadThread._to_bytes(spd_val, spd_unit)
-                        done_bytes = total_bytes * (pct / 100.0)
-
-                        self.progress_signal.emit({
-                            "status": "downloading",
-                            "_percent_str": f"{pct:.1f}%",
-                            "_total_bytes_str": f"{total_val:.1f}{total_unit}",
-                            "_speed_str": f"{spd_val:.1f}{spd_unit}/s",
-                            "_eta_str": eta_str,
-                            "downloaded_bytes": done_bytes,
-                            "total_bytes": total_bytes,
-                            "speed": speed_bytes,
-                        })
-
-                ret = self._proc.wait()
+                ret, path, err = _run_ytdlp_cli(self, cmd, self.progress_signal.emit)
                 if self.is_cancelled:
                     break
 
-                best = merge_dest or last_dest or ""
-                if best and not os.path.exists(best):
-                    best = DownloadThread._resolve_merged(
-                        last_dest, self.ydl_opts.get("merge_output_format", "")
-                    ) or best
-
                 if ret != 0:
-                    self.error_signal.emit(f"yt-dlp exited with code {ret}", i)
+                    self.error_signal.emit(err or f"yt-dlp exited with code {ret}", i)
                 else:
-                    self.video_done_signal.emit(self.current_index, best)
+                    self.video_done_signal.emit(self.current_index, path)
 
             except Exception as e:
                 if self.is_cancelled:
@@ -800,15 +753,8 @@ class PlaylistDownloadThread(QThread):
             self.all_done_signal.emit()
 
     def cancel(self):
-        """Signal cancellation. Do NOT wait() here — blocks the UI event loop."""
         self.is_cancelled = True
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
-        if self.isRunning():
-            self.terminate()
+        _kill_process_tree(self._proc)
 
 
 class ConversionThread(QThread):
@@ -1132,38 +1078,7 @@ class LiveStreamThread(QThread):
 
     def cancel(self):
         self.is_cancelled = True
-        if self._proc and self._proc.poll() is None:
-            if os.name == "nt":
-                try:
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
-                        capture_output=True,
-                        creationflags=subprocess.CREATE_NO_WINDOW
-                    )
-                except Exception:
-                    self._proc.terminate()
-            else:
-                import signal as _sig
-                try:
-                    self._proc.send_signal(_sig.SIGTERM)
-                except Exception:
-                    self._proc.terminate()
-        self.is_cancelled = True
-        if self._proc and self._proc.poll() is None:
-            if os.name == "nt":
-                try:
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
-                        capture_output=True,
-                        creationflags=subprocess.CREATE_NO_WINDOW
-                    )
-                except Exception:
-                    self._proc.terminate()
-        else:
-                import signal as _sig
-                try:
-                    self._proc.send_signal(_sig.SIGTERM)
-                except Exception:
-                    self._proc.terminate()
+        _kill_process_tree(self._proc)
 
 
 class DownloadManager:
@@ -1188,8 +1103,6 @@ class DownloadManager:
 
     def _on_done(self, t: DownloadThread):
         with self._lock:
-            self.active_downloads.discard(t) if hasattr(
-                self.active_downloads, "discard") else None
             if t in self.active_downloads:
                 self.active_downloads.remove(t)
             if self.download_queue:
@@ -1327,6 +1240,8 @@ class VideoDownloader(QMainWindow):
         self._pl_speed_samples     = deque(maxlen=8)
 
         self.download_manager = DownloadManager()
+        self._retired_threads      = set()   # keep refs until QThreads really finish
+        self._info_request_id      = 0
 
         self.setup_ui_style()
         self.init_ui()
@@ -1334,6 +1249,25 @@ class VideoDownloader(QMainWindow):
 
         # ── Startup yt-dlp version check (delayed, non-blocking) ──
         QTimer.singleShot(2000, self._startup_ytdlp_check)
+
+    def _retire_thread(self, thread):
+        """Detach a running thread: keep it alive until it finishes (a QThread
+        destroyed while running crashes the app) and ignore its results."""
+        if thread is None:
+            return
+        for sig_name in ("info_ready", "error", "finished", "progress_signal",
+                         "error_signal", "finished_signal", "status_signal",
+                         "video_started_signal", "video_done_signal",
+                         "all_done_signal"):
+            sig = getattr(thread, sig_name, None)
+            if sig is not None:
+                try:
+                    sig.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+        self._retired_threads = {t for t in self._retired_threads if t.isRunning()}
+        if thread.isRunning():
+            self._retired_threads.add(thread)
 
     def _startup_ytdlp_check(self):
         """Background check for yt-dlp updates on app startup."""
@@ -1343,7 +1277,7 @@ class VideoDownloader(QMainWindow):
 
     def _on_startup_ytdlp_result(self, current: str, latest: str):
         """Show a non-intrusive notification if yt-dlp is outdated."""
-        if current < latest:
+        if _version_key(current) < _version_key(latest):
             reply = QMessageBox.question(
                 self, "yt-dlp Update Available",
                 f"Your yt-dlp engine ({current}) is outdated.\n"
@@ -1761,10 +1695,8 @@ class VideoDownloader(QMainWindow):
             self.reset_url_view()
 
     def _start_info_fetch(self, url: str):
-        # Cancel any ongoing fetch
-        if self._info_thread and self._info_thread.isRunning():
-            self._info_thread.terminate()
-            self._info_thread.wait(1000)
+        # Drop any ongoing fetch (its result is ignored; thread is kept alive)
+        self._retire_thread(self._info_thread)
 
         self.paste_button.setText("Fetching...")
         self.paste_button.setEnabled(False)
@@ -1782,9 +1714,8 @@ class VideoDownloader(QMainWindow):
         # Auto-redirect live streams to Live Stream tab
         is_live = (
             info.get("is_live") or
-            info.get("was_live") or
             info.get("live_status") in ("is_live", "is_upcoming") or
-            info.get("duration") is None   # live/unknown duration = probably live
+            (info.get("duration") is None and info.get("live_status") != "was_live")
         )
         if is_live:
             url = self.url_input.text().strip()
@@ -1824,8 +1755,7 @@ class VideoDownloader(QMainWindow):
         thumb_url = info.get("thumbnail")
         self.current_thumbnail_url = thumb_url
         if thumb_url:
-            if self._thumbnail_thread and self._thumbnail_thread.isRunning():
-                self._thumbnail_thread.terminate()
+            self._retire_thread(self._thumbnail_thread)
             self._thumbnail_thread = ThumbnailThread(thumb_url)
             self._thumbnail_thread.finished.connect(self._on_thumbnail_ready)
             self._thumbnail_thread.start()
@@ -1882,7 +1812,8 @@ class VideoDownloader(QMainWindow):
 
     def _on_thumbnail_ready(self, data: bytes):
         px = QPixmap()
-        px.loadFromData(data)
+        if not px.loadFromData(data):
+            return
         self.thumbnail_label.setPixmap(px)
         self.thumbnail_label.setScaledContents(True)
 
@@ -1895,7 +1826,9 @@ class VideoDownloader(QMainWindow):
             if f.get("vcodec") != "none" and f.get("height") is not None
         ]
         video_formats.sort(
-            key=lambda x: (x.get("height", 0) or 0, x.get("filesize", 0) or 0),
+            key=lambda x: (x.get("height", 0) or 0,
+                           x.get("fps", 0) or 0,
+                           x.get("tbr", 0) or 0),
             reverse=True,
         )
 
@@ -1936,7 +1869,7 @@ class VideoDownloader(QMainWindow):
             fps_item = QTableWidgetItem(f"{fps} FPS" if fps != "N/A" else "N/A")
             fps_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            fsize = f.get("filesize", 0)
+            fsize = f.get("filesize") or f.get("filesize_approx") or 0
             if fsize:
                 s_str = (f"{fsize/1024**3:.1f} GB"
                          if fsize > 1024**3 else f"{fsize/1024**2:.1f} MB")
@@ -2010,6 +1943,12 @@ class VideoDownloader(QMainWindow):
                     "format": "bestaudio/best",
                     "outtmpl": os.path.join(download_path, f"%(title)s_{bitrate_tag}k.%(ext)s"),
                     "quiet": True, "no_warnings": True,
+                    "restrictfilenames": True,
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": bitrate_tag,
+                    }],
                     **speed_opts,
                 }
                 if self.yt_time_range_cb.isChecked():
@@ -2019,6 +1958,7 @@ class VideoDownloader(QMainWindow):
                         ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(
                             None,[(self._to_seconds(start_t), self._to_seconds(end_t))]
                         )
+                        ydl_opts["_sections"] = [f"*{start_t}-{end_t}"]
                         ydl_opts["force_keyframes_at_cuts"] = True
                         self.download_progress.setRange(0, 0)
                         self.download_percent.setText("Progress: cutting...")
@@ -2041,6 +1981,7 @@ class VideoDownloader(QMainWindow):
                     "outtmpl": os.path.join(download_path, f"%(title)s_{quality_txt}.%(ext)s"),
                     "merge_output_format": "mkv",
                     "keepvideo": False,
+                    "restrictfilenames": True,
                     "quiet": True,
                     "no_warnings": True,
                     **speed_opts,
@@ -2053,11 +1994,13 @@ class VideoDownloader(QMainWindow):
                         ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(
                             None,[(self._to_seconds(start_t), self._to_seconds(end_t))]
                         )
+                        ydl_opts["_sections"] = [f"*{start_t}-{end_t}"]
                         ydl_opts["force_keyframes_at_cuts"] = True
                     elif start_t:
                         ydl_opts["download_ranges"] = yt_dlp.utils.download_range_func(
                             None,[(self._to_seconds(start_t), float("inf"))]
                         )
+                        ydl_opts["_sections"] = [f"*{start_t}-inf"]
                         ydl_opts["force_keyframes_at_cuts"] = True
                         self.download_progress.setRange(0, 0)
 
@@ -2183,13 +2126,12 @@ class VideoDownloader(QMainWindow):
         self.reset_download_state()
 
     def on_download_complete(self, downloaded_file: str):
+        final_file = downloaded_file
+        # Reset the UI first: the completion dialog is modal, and the
+        # "Merging..." animation would otherwise keep spinning behind it.
+        self.reset_download_state()
         try:
-            final_file = downloaded_file
-            if getattr(self, "mp3_conversion_mode", False):
-                converted = self.convert_to_mp3(downloaded_file)
-                if converted:
-                    final_file = converted
-
+            self._cleanup_temp_files(final_file)
             self.add_to_history(
                 os.path.basename(final_file),
                 self.url_input.text(),
@@ -2199,8 +2141,26 @@ class VideoDownloader(QMainWindow):
             self._show_done_dialog(final_file)
         except Exception as e:
             print(f"Post-download error: {e}")
-        finally:
-            self.reset_download_state()
+
+    def _cleanup_temp_files(self, filepath: str):
+        """Remove leftover .part and .ytdl temp files from the download directory."""
+        if not filepath:
+            return
+        try:
+            directory = os.path.dirname(filepath) or "."
+            base = os.path.splitext(os.path.basename(filepath))[0]
+            # Strip yt-dlp format tags (e.g. .f137, .f251) to match all related temp files
+            base = re.sub(r"\.f\d+$", "", base)
+            if len(base) < 3:
+                return
+            for f in os.listdir(directory):
+                if f.startswith(base) and (f.endswith(".part") or f.endswith(".ytdl")):
+                    try:
+                        os.remove(os.path.join(directory, f))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def _show_done_dialog(self, filepath: str, title: str = "Download Complete"):
         """Custom completion dialog with Open File/Folder and Show in Folder buttons."""
@@ -2325,50 +2285,12 @@ class VideoDownloader(QMainWindow):
         except FileNotFoundError:
             QMessageBox.warning(self, "Error", "FFmpeg not found. Please install it from the Settings tab.")
             return None
-        """Convert downloaded audio to MP3 using libmp3lame (standard encoder)."""
-        output = os.path.splitext(input_file)[0] + ".mp3"
-        quality = getattr(self, "audio_quality_combo", None)
-        bitrate = quality.currentText() if quality else "192k"
-        if bitrate == "Best":
-            bitrate = "320k"
-            bitrate_tag = bitrate.replace("k", "")
-    
-        # ── Input'taki geçici ext'i at, bitrate'i ekle ──────
-        base = re.sub(r"\.[a-z0-9]+$", "", input_file, flags=re.IGNORECASE)
-        # Eğer zaten _320k gibi bir tag varsa üstüne ekleme
-        if not base.endswith(f"_{bitrate_tag}k"):
-            output = f"{base}_{bitrate_tag}k.mp3"
-        else:
-            output = f"{base}.mp3"
-        cmd = ["ffmpeg", "-i", input_file,
-               "-c:a", "libmp3lame",   # FIXED: was libshine (not in standard FFmpeg)
-               "-b:a", bitrate,
-               "-y", output]
-        try:
-            result = subprocess.run(cmd, capture_output=True, encoding='utf-8', errors='replace')
-            if result.returncode == 0:
-                # Remove original if different file
-                if os.path.abspath(input_file) != os.path.abspath(output):
-                    try:
-                        os.remove(input_file)
-                    except Exception:
-                        pass
-                return output
-            else:
-                err = result.stderr[-500:] if result.stderr else "Unknown error"
-                QMessageBox.warning(self, "MP3 Conversion Error", err)
-                return None
-        except FileNotFoundError:
-            QMessageBox.warning(self, "Error",
-                "FFmpeg not found. Please install it from the Settings tab.")
-            return None
 
     def reset_download_state(self):
         try:
             if self.active_download:
-                self.active_download.is_cancelled = True
-                self.active_download.quit()
-                self.active_download.wait(2000)
+                self.active_download.cancel()
+                self._retire_thread(self.active_download)
                 self.active_download = None
             
             # Monitor timer'ı durdur
@@ -2414,18 +2336,33 @@ class VideoDownloader(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        dl_dir = self.get_download_path()
+        dl_dir     = self.get_download_path()
+        started_at = self.active_download.started_at
         self.active_download.cancel()
-
-        # Clean up partial files
-        for fname in os.listdir(dl_dir):
-            if fname.endswith((".part", ".temp", ".ytdl")):
-                try:
-                    os.remove(os.path.join(dl_dir, fname))
-                except Exception:
-                    pass
-
         self.reset_download_state()
+
+        # Clean up partial files created by THIS download only (never other
+        # downloads' or the user's own .part files).  Retry briefly: the killed
+        # process may still hold its file handles for a moment.
+        def _cleanup(attempts=5):
+            leftover = False
+            try:
+                for fname in os.listdir(dl_dir):
+                    if not re.search(r"\.(part|temp|ytdl)(-Frag\d+)?$", fname):
+                        continue
+                    fpath = os.path.join(dl_dir, fname)
+                    try:
+                        if os.path.getmtime(fpath) < started_at - 1:
+                            continue
+                        os.remove(fpath)
+                    except OSError:
+                        leftover = True
+            except OSError:
+                return
+            if leftover and attempts > 1:
+                QTimer.singleShot(500, lambda: _cleanup(attempts - 1))
+
+        QTimer.singleShot(300, _cleanup)
         QMessageBox.information(self, "Cancelled",
             "Download cancelled and temporary files removed.")
 
@@ -2678,6 +2615,7 @@ class VideoDownloader(QMainWindow):
             except ValueError:
                 pass
 
+        self._retire_thread(self._playlist_info_thread)
         self._playlist_info_thread = PlaylistInfoThread(url, max_items=max_items)
         self._playlist_info_thread.info_ready.connect(self.on_playlist_info_ready)
         self._playlist_info_thread.error.connect(self.on_playlist_info_error)
@@ -2704,11 +2642,11 @@ class VideoDownloader(QMainWindow):
         pl_title = info.get("title") or info.get("playlist_title") or "Playlist"
         self.pl_info_label.setText(f"📋  <b>{pl_title}</b>  —  {len(entries)} video(s) found")
 
-        self.pl_table.setRowCount(0)
+        self.pl_table.setUpdatesEnabled(False)
+        self.pl_table.setRowCount(len(entries))
         for i, entry in enumerate(entries):
-            row = self.pl_table.rowCount()
-            self.pl_table.insertRow(row)
-            
+            row = i
+
             checkbox_item = QTableWidgetItem()
             checkbox_item.setCheckState(Qt.CheckState.Checked)
             checkbox_item.setFlags(checkbox_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -2727,6 +2665,7 @@ class VideoDownloader(QMainWindow):
             status.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.pl_table.setItem(row, 3, status)
 
+        self.pl_table.setUpdatesEnabled(True)
         self.pl_start_btn.setEnabled(len(entries) > 0)
         self.pl_select_all_btn.setEnabled(len(entries) > 0)
         self.pl_deselect_all_btn.setEnabled(len(entries) > 0)
@@ -2792,6 +2731,7 @@ class VideoDownloader(QMainWindow):
                 "outtmpl": os.path.join(download_path, "%(title)s.%(ext)s"),
                 "postprocessors":[{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
                 "quiet": True, "no_warnings": True,
+                "restrictfilenames": True,
                 **speed_opts,
             }
         else:
@@ -2804,7 +2744,7 @@ class VideoDownloader(QMainWindow):
                 "outtmpl": os.path.join(download_path, "%(title)s_%(height)sp.%(ext)s"),
                 "merge_output_format": "mkv",
                 "quiet": True, "no_warnings": True,
-                "encoding": "utf-8", "restrictfilenames": False, "windowsfilenames": True, "keepvideo": False,
+                "restrictfilenames": True, "windowsfilenames": True, "keepvideo": False,
                 **speed_opts,
             }
 
@@ -2831,13 +2771,6 @@ class VideoDownloader(QMainWindow):
         total_selected = len(getattr(self, '_pl_selected_indices', self._playlist_entries))
         self.pl_current_label.setText(f"Downloading {index}/{total_selected}: {title}")
         self.pl_video_bar.setValue(0)
-        
-        if index > 1:
-            prev_table_row = self._pl_selected_indices[index - 2]
-            status_item = self.pl_table.item(prev_table_row, 3)
-            if status_item:
-                status_item.setText("✅ Done")
-                status_item.setForeground(QColor("#4caf50"))
         
         curr_table_row = self._pl_selected_indices[index - 1]
         status_item = self.pl_table.item(curr_table_row, 3)
@@ -2918,6 +2851,7 @@ class VideoDownloader(QMainWindow):
     def cancel_playlist_download(self):
         if self.active_playlist_dl:
             self.active_playlist_dl.cancel()
+            self._retire_thread(self.active_playlist_dl)
         self.reset_playlist_state()
         self.pl_current_label.setText("Cancelled.")
 
@@ -4069,6 +4003,8 @@ class VideoDownloader(QMainWindow):
             db_path    = os.path.join(self.get_app_data_dir(), "download_history.db")
             self.conn  = sqlite3.connect(db_path, check_same_thread=False)
             cursor     = self.conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS downloads (
                     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4079,6 +4015,7 @@ class VideoDownloader(QMainWindow):
                     filepath TEXT
                 )
             """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloads_date ON downloads(date)")
             self.conn.commit()
         except Exception as e:
             QMessageBox.warning(self, "Database Error",
@@ -4107,10 +4044,11 @@ class VideoDownloader(QMainWindow):
                 "FROM downloads ORDER BY date DESC"
             )
             rows = cur.fetchall()
+            self.history_table.setUpdatesEnabled(False)
+            self.history_table.setSortingEnabled(False)
             self.history_table.setRowCount(0)
-            for row_data in rows:
-                row = self.history_table.rowCount()
-                self.history_table.insertRow(row)
+            self.history_table.setRowCount(len(rows))
+            for row, row_data in enumerate(rows):
                 for col, data in enumerate(row_data):
                     text = str(data)
                     # Col 1: strip intermediate format tag for display (.f251.webm → .mkv hint)
@@ -4127,6 +4065,8 @@ class VideoDownloader(QMainWindow):
                     self.history_table.setItem(row, col, item)
         except Exception as e:
             print(f"History load error: {e}")
+        finally:
+            self.history_table.setUpdatesEnabled(True)
 
     def clear_history(self):
         reply = QMessageBox.question(
@@ -4636,6 +4576,28 @@ class VideoDownloader(QMainWindow):
         finally:
             self.ffmpeg_download_button.setEnabled(True)
             self.update_ffmpeg_status()
+
+    def closeEvent(self, event):
+        """Stop child processes and threads cleanly so nothing is orphaned."""
+        for t in (self.active_download, self.active_playlist_dl, self.active_live_dl):
+            if t is not None:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+        threads = [t for t in (self.active_download, self.active_playlist_dl,
+                               self.active_live_dl, self._info_thread,
+                               self._thumbnail_thread, self._playlist_info_thread)
+                   if t is not None]
+        threads += list(self._retired_threads)
+        for t in threads:
+            if t.isRunning():
+                t.wait(1500)
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def get_app_data_dir(self) -> str:
         if os.name == "nt":
