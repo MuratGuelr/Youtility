@@ -131,7 +131,9 @@ jobs:
           else
             notes="RELEASE_NOTES_${TAG}.md"
             if [ -f "$notes" ]; then
-              gh release create "$TAG" "${files[@]}" --title "$TAG" --notes-file "$notes"
+              # Başlık: notların ilk satırındaki "# ..." başlığı (yoksa etiket adı)
+              title="$(head -n 1 "$notes" | sed -E 's/^#+[[:space:]]*//; s/\r$//')"
+              gh release create "$TAG" "${files[@]}" --title "${title:-$TAG}" --notes-file "$notes"
             else
               gh release create "$TAG" "${files[@]}" --title "$TAG" --generate-notes
             fi
