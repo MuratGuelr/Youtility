@@ -1,5 +1,3 @@
 PyQt6
 yt-dlp
 requests
-ffmpeg-python
-python-ffmpeg-binary
